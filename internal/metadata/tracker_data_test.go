@@ -1,0 +1,676 @@
+// Copyright (c) 2025-2026, Audionut and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+package metadata
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/autobrr/upbrr/internal/config"
+	"github.com/autobrr/upbrr/internal/services/bbcode"
+	"github.com/autobrr/upbrr/internal/trackerdata"
+	"github.com/autobrr/upbrr/pkg/api"
+)
+
+type stubTrackerLookup struct {
+	results map[string]trackerdata.Result
+	calls   []string
+	delays  map[string]time.Duration
+	mu      sync.Mutex
+}
+
+func (s *stubTrackerLookup) Lookup(
+	ctx context.Context,
+	tracker string,
+	trackerID string,
+	meta api.PreparedMetadata,
+	searchFileName string,
+	onlyID bool,
+	keepImages bool,
+) (trackerdata.Result, error) {
+	s.mu.Lock()
+	s.calls = append(s.calls, tracker)
+	delay := s.delays[tracker]
+	s.mu.Unlock()
+
+	if delay > 0 {
+		select {
+		case <-ctx.Done():
+			return trackerdata.Result{}, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+
+	if value, ok := s.results[tracker]; ok {
+		return value, nil
+	}
+	return trackerdata.Result{}, nil
+}
+
+func (s *stubTrackerLookup) Calls() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cloned := make([]string, len(s.calls))
+	copy(cloned, s.calls)
+	return cloned
+}
+
+func trackerRecordFor(trackerData []api.TrackerMetadata, tracker string) (api.TrackerMetadata, bool) {
+	for _, record := range trackerData {
+		if strings.EqualFold(record.Tracker, tracker) {
+			return record, true
+		}
+	}
+	return api.TrackerMetadata{}, false
+}
+
+func TestEnrichTrackerDataStopsAfterFirstPriorityIDWinner(t *testing.T) {
+	repo := &fakeRepo{}
+	lookup := &stubTrackerLookup{
+		results: map[string]trackerdata.Result{
+			"ANT": {TMDBID: 123, IMDBID: 456, TrackerID: "101"},
+			"HDB": {TMDBID: 999, TrackerID: "202"},
+		},
+		delays: map[string]time.Duration{
+			"ANT": 60 * time.Millisecond,
+			"HDB": 5 * time.Millisecond,
+		},
+	}
+	cfg := config.Config{
+		Trackers: config.TrackersConfig{
+			Trackers: map[string]config.TrackerConfig{
+				"ANT": {APIKey: "ant-key"},
+				"HDB": {Username: "user", Passkey: "pass"},
+			},
+		},
+	}
+	svc := NewService(repo, WithConfig(cfg), WithTrackerDataLookup(lookup))
+
+	meta := api.PreparedMetadata{
+		SourcePath: `D:\Movies\A.Better.Life.2011.BluRay.1080p.DTS.x264-CHD`,
+		TrackerIDs: map[string]string{
+			"ant": "101",
+			"hdb": "202",
+		},
+	}
+
+	result, err := svc.EnrichTrackerData(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("enrich: %v", err)
+	}
+
+	calls := lookup.Calls()
+	if len(calls) == 0 {
+		t.Fatalf("expected at least one lookup call")
+	}
+	winner, found := trackerRecordFor(result.TrackerData, "ANT")
+	if !found {
+		t.Fatalf("expected ANT tracker winner record, got %v", result.TrackerData)
+	}
+	if winner.TMDBID == 0 && winner.IMDBID == 0 && winner.TVDBID == 0 {
+		t.Fatalf("expected metadata ids on winner record")
+	}
+	if len(calls) != 1 || !strings.EqualFold(calls[0], "ANT") {
+		t.Fatalf("expected strict priority stop after ANT, calls=%v", calls)
+	}
+	if len(repo.trackerMetadata) == 0 {
+		t.Fatalf("expected persisted tracker records")
+	}
+}
+
+func TestEnrichTrackerDataPreferredTrackerOverridesStaticPriority(t *testing.T) {
+	repo := &fakeRepo{}
+	lookup := &stubTrackerLookup{
+		results: map[string]trackerdata.Result{
+			"ANT": {TMDBID: 123, TrackerID: "101"},
+			"HDB": {TMDBID: 999, TrackerID: "202"},
+		},
+		delays: map[string]time.Duration{
+			"ANT": 40 * time.Millisecond,
+			"HDB": 5 * time.Millisecond,
+		},
+	}
+	cfg := config.Config{
+		Trackers: config.TrackersConfig{
+			PreferredTracker: "HDB",
+			Trackers: map[string]config.TrackerConfig{
+				"ANT": {APIKey: "ant-key"},
+				"HDB": {Username: "user", Passkey: "pass"},
+			},
+		},
+	}
+	svc := NewService(repo, WithConfig(cfg), WithTrackerDataLookup(lookup))
+
+	meta := api.PreparedMetadata{
+		SourcePath: `D:\Movies\A.Better.Life.2011.BluRay.1080p.DTS.x264-CHD`,
+		TrackerIDs: map[string]string{
+			"ant": "101",
+			"hdb": "202",
+		},
+	}
+
+	result, err := svc.EnrichTrackerData(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("enrich: %v", err)
+	}
+
+	calls := lookup.Calls()
+	if len(calls) != 1 || !strings.EqualFold(calls[0], "HDB") {
+		t.Fatalf("expected preferred tracker HDB queried first and to stop after winner, calls=%v", calls)
+	}
+	winner, found := trackerRecordFor(result.TrackerData, "HDB")
+	if !found || winner.TMDBID == 0 {
+		t.Fatalf("expected HDB winner with metadata ids, got %v", result.TrackerData)
+	}
+}
+
+func TestEnrichTrackerDataUsesConcurrentWinnerWithoutClientTrackerIDs(t *testing.T) {
+	repo := &fakeRepo{}
+	lookup := &stubTrackerLookup{
+		results: map[string]trackerdata.Result{
+			"ANT": {TMDBID: 123, IMDBID: 456, TrackerID: "101"},
+			"HDB": {TMDBID: 999, TrackerID: "202"},
+		},
+		delays: map[string]time.Duration{
+			"ANT": 60 * time.Millisecond,
+			"HDB": 5 * time.Millisecond,
+		},
+	}
+	cfg := config.Config{
+		Trackers: config.TrackersConfig{
+			Trackers: map[string]config.TrackerConfig{
+				"ANT": {APIKey: "ant-key"},
+				"HDB": {Username: "user", Passkey: "pass"},
+			},
+		},
+	}
+	svc := NewService(repo, WithConfig(cfg), WithTrackerDataLookup(lookup))
+
+	meta := api.PreparedMetadata{
+		SourcePath: `D:\Movies\A.Better.Life.2011.BluRay.1080p.DTS.x264-CHD`,
+		Trackers:   []string{"ANT", "HDB"},
+	}
+
+	result, err := svc.EnrichTrackerData(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("enrich: %v", err)
+	}
+
+	winner, found := trackerRecordFor(result.TrackerData, "HDB")
+	if !found {
+		t.Fatalf("expected HDB tracker winner record from fastest concurrent lookup, got %v", result.TrackerData)
+	}
+	if winner.TMDBID == 0 && winner.IMDBID == 0 && winner.TVDBID == 0 {
+		t.Fatalf("expected metadata ids on winner record")
+	}
+}
+
+func TestEnrichTrackerDataContinuesUntilIDsFound(t *testing.T) {
+	repo := &fakeRepo{}
+	lookup := &stubTrackerLookup{
+		results: map[string]trackerdata.Result{
+			"ANT": {Description: "desc only", TrackerID: "101"},
+			"HDB": {IMDBID: 1554091, TrackerID: "202"},
+			"PTP": {TMDBID: 55720, TrackerID: "303"},
+		},
+		delays: map[string]time.Duration{
+			"ANT": 5 * time.Millisecond,
+			"HDB": 40 * time.Millisecond,
+			"PTP": 75 * time.Millisecond,
+		},
+	}
+	cfg := config.Config{
+		Trackers: config.TrackersConfig{
+			Trackers: map[string]config.TrackerConfig{
+				"ANT": {APIKey: "ant-key"},
+				"HDB": {Username: "user", Passkey: "pass"},
+				"PTP": {ApiUser: "user", ApiKey: "key"},
+			},
+		},
+	}
+	svc := NewService(repo, WithConfig(cfg), WithTrackerDataLookup(lookup))
+
+	meta := api.PreparedMetadata{
+		SourcePath: `D:\Movies\A.Better.Life.2011.BluRay.1080p.DTS.x264-CHD`,
+		TrackerIDs: map[string]string{
+			"ant": "101",
+			"hdb": "202",
+			"ptp": "303",
+		},
+	}
+
+	result, err := svc.EnrichTrackerData(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("enrich: %v", err)
+	}
+
+	calls := lookup.Calls()
+	if len(calls) == 0 {
+		t.Fatalf("expected lookup calls")
+	}
+	winner, found := trackerRecordFor(result.TrackerData, "HDB")
+	if !found {
+		t.Fatalf("expected HDB id winner record, got %v", result.TrackerData)
+	}
+	if winner.IMDBID == 0 {
+		t.Fatalf("expected HDB imdb id to be set")
+	}
+}
+
+func TestApplyTrackerClaimsBlocksAitherAndCachesClaims(t *testing.T) {
+	t.Parallel()
+
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if got := r.URL.Path; got != "/api/internals/claim" {
+			t.Fatalf("unexpected path %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer aither-key" {
+			t.Fatalf("unexpected auth header %q", got)
+		}
+		_, _ = w.Write([]byte(`{
+			"data":[
+				{"attributes":{"title":"Example Show","season":2,"tmdb_id":4242,"categories":["2"],"resolutions":["3"],"types":["4"]}}
+			],
+			"meta":{"next_cursor":""}
+		}`))
+	}))
+	defer server.Close()
+
+	tempDir := t.TempDir()
+	cfg := config.Config{
+		MainSettings: config.MainSettingsConfig{DBPath: filepath.Join(tempDir, "db.sqlite")},
+		Trackers: config.TrackersConfig{
+			Trackers: map[string]config.TrackerConfig{
+				"AITHER": {
+					APIKey:      "aither-key",
+					AnnounceURL: server.URL + "/announce",
+				},
+			},
+		},
+	}
+
+	svc := NewService(&fakeRepo{}, WithConfig(cfg))
+	meta := api.PreparedMetadata{
+		SourcePath: "/media/Example.Show.S02E03.mkv",
+		Trackers:   []string{"AITHER"},
+		Type:       "WEBDL",
+		Release:    api.ReleaseInfo{Resolution: "1080p", Season: 2},
+		SeasonInt:  2,
+		ExternalIDs: api.ExternalIDs{
+			TMDBID: 4242,
+		},
+	}
+
+	result, err := svc.applyTrackerClaims(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("apply tracker claims: %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("expected one claim fetch, got %d", requests)
+	}
+	if got := result.BlockedTrackers["AITHER"]; len(got) != 1 || got[0] != api.TrackerBlockReasonClaim {
+		t.Fatalf("expected AITHER claim block, got %#v", result.BlockedTrackers)
+	}
+
+	cachePath := filepath.Join(tempDir, "cache", "banned", "AITHER_claimed_releases.json")
+	if _, err := os.Stat(cachePath); err != nil {
+		t.Fatalf("expected claims cache file at %s: %v", cachePath, err)
+	}
+
+	cacheData, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read claims cache: %v", err)
+	}
+	if !strings.Contains(string(cacheData), `"resolutions": [`) || !strings.Contains(string(cacheData), `"1080P"`) {
+		t.Fatalf("expected semantic resolutions in cache, got %s", string(cacheData))
+	}
+	if !strings.Contains(string(cacheData), `"types": [`) || !strings.Contains(string(cacheData), `"WEBDL"`) {
+		t.Fatalf("expected semantic types in cache, got %s", string(cacheData))
+	}
+
+	result, err = svc.applyTrackerClaims(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("apply tracker claims from cache: %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("expected cached claims to avoid refetch, got %d requests", requests)
+	}
+	if got := result.BlockedTrackers["AITHER"]; len(got) != 1 || got[0] != api.TrackerBlockReasonClaim {
+		t.Fatalf("expected cached AITHER claim block, got %#v", result.BlockedTrackers)
+	}
+}
+
+func TestApplyTrackerClaimsDoesNotBlockOnSemanticMismatch(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{
+			"data":[
+				{"attributes":{"title":"Example Show","season":2,"tmdb_id":4242,"resolutions":["2"],"types":["4"]}}
+			],
+			"meta":{"next_cursor":""}
+		}`))
+	}))
+	defer server.Close()
+
+	tempDir := t.TempDir()
+	cfg := config.Config{
+		MainSettings: config.MainSettingsConfig{DBPath: filepath.Join(tempDir, "db.sqlite")},
+		Trackers: config.TrackersConfig{
+			Trackers: map[string]config.TrackerConfig{
+				"AITHER": {
+					APIKey:      "aither-key",
+					AnnounceURL: server.URL + "/announce",
+				},
+			},
+		},
+	}
+
+	svc := NewService(&fakeRepo{}, WithConfig(cfg))
+	meta := api.PreparedMetadata{
+		SourcePath: "/media/Example.Show.S02E03.mkv",
+		Trackers:   []string{"AITHER"},
+		Type:       "WEBDL",
+		Release:    api.ReleaseInfo{Resolution: "1080p", Season: 2},
+		SeasonInt:  2,
+		ExternalIDs: api.ExternalIDs{
+			TMDBID: 4242,
+		},
+	}
+
+	result, err := svc.applyTrackerClaims(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("apply tracker claims: %v", err)
+	}
+	if len(result.BlockedTrackers["AITHER"]) != 0 {
+		t.Fatalf("expected no claim block for mismatched semantic resolution, got %#v", result.BlockedTrackers)
+	}
+}
+
+func TestEnrichTrackerDataSkipsLookupWhenStoredFresh(t *testing.T) {
+	repo := &fakeRepo{}
+	lookup := &stubTrackerLookup{}
+	cfg := config.Config{
+		Trackers: config.TrackersConfig{
+			Trackers: map[string]config.TrackerConfig{
+				"ANT": {APIKey: "ant-key"},
+			},
+		},
+	}
+	svc := NewService(repo, WithConfig(cfg), WithTrackerDataLookup(lookup))
+
+	meta := api.PreparedMetadata{
+		SourcePath:      `D:\Movies\A.Better.Life.2011.BluRay.1080p.DTS.x264-CHD`,
+		StoredDataFresh: true,
+		Trackers:        []string{"ANT"},
+	}
+
+	result, err := svc.EnrichTrackerData(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("enrich: %v", err)
+	}
+	if len(lookup.Calls()) != 0 {
+		t.Fatalf("expected no tracker lookups, got %v", lookup.Calls())
+	}
+	if len(result.TrackerData) != 0 {
+		t.Fatalf("expected no tracker data changes, got %d records", len(result.TrackerData))
+	}
+}
+
+func TestEnrichTrackerDataDeprioritizesBTNWhenKeepingImages(t *testing.T) {
+	repo := &fakeRepo{}
+	lookup := &stubTrackerLookup{
+		results: map[string]trackerdata.Result{
+			"BHD": {TMDBID: 513053, TrackerID: "513053", Description: "desc", Images: []bbcode.Image{{RawURL: "https://img.example/a.jpg"}}},
+			"BTN": {IMDBID: 39050141, TrackerID: "2167358"},
+		},
+		delays: map[string]time.Duration{
+			"BHD": 5 * time.Millisecond,
+			"BTN": 40 * time.Millisecond,
+		},
+	}
+	longToken := strings.Repeat("a", minTrackerTokenLen)
+	cfg := config.Config{
+		Metadata: config.MetadataConfig{BTNAPI: strings.Repeat("b", minTrackerTokenLen)},
+		Trackers: config.TrackersConfig{
+			Trackers: map[string]config.TrackerConfig{
+				"BHD": {APIKey: longToken, BhdRSSKey: longToken},
+			},
+		},
+	}
+	svc := NewService(repo, WithConfig(cfg), WithTrackerDataLookup(lookup))
+
+	meta := api.PreparedMetadata{
+		SourcePath: `D:\temp\Love.Through.A.Prism.S01.1080p.NF.WEB-DL.DDP5.1.DV.H.265-ppkhoa`,
+		TrackerIDs: map[string]string{
+			"btn": "2167358",
+			"bhd": "513053",
+		},
+		Options: api.UploadOptions{KeepImages: true},
+	}
+
+	result, err := svc.EnrichTrackerData(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("enrich: %v", err)
+	}
+
+	winner, found := trackerRecordFor(result.TrackerData, "BHD")
+	if !found {
+		t.Fatalf("expected BHD tracker winner record, got %v", result.TrackerData)
+	}
+	if winner.TMDBID == 0 {
+		t.Fatalf("expected BHD winner metadata id")
+	}
+}
+
+func TestEnrichTrackerDataKeepsBTNAsFallbackWhenKeepingImages(t *testing.T) {
+	repo := &fakeRepo{}
+	lookup := &stubTrackerLookup{
+		results: map[string]trackerdata.Result{
+			"BHD": {Description: "desc only", TrackerID: "513053"},
+			"BTN": {IMDBID: 39050141, TrackerID: "2167358"},
+		},
+		delays: map[string]time.Duration{
+			"BHD": 5 * time.Millisecond,
+			"BTN": 35 * time.Millisecond,
+		},
+	}
+	longToken := strings.Repeat("a", minTrackerTokenLen)
+	cfg := config.Config{
+		Metadata: config.MetadataConfig{BTNAPI: strings.Repeat("b", minTrackerTokenLen)},
+		Trackers: config.TrackersConfig{
+			Trackers: map[string]config.TrackerConfig{
+				"BHD": {APIKey: longToken, BhdRSSKey: longToken},
+			},
+		},
+	}
+	svc := NewService(repo, WithConfig(cfg), WithTrackerDataLookup(lookup))
+
+	meta := api.PreparedMetadata{
+		SourcePath: `D:\temp\Love.Through.A.Prism.S01.1080p.NF.WEB-DL.DDP5.1.DV.H.265-ppkhoa`,
+		TrackerIDs: map[string]string{
+			"btn": "2167358",
+			"bhd": "513053",
+		},
+		Options: api.UploadOptions{KeepImages: true},
+	}
+
+	result, err := svc.EnrichTrackerData(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("enrich: %v", err)
+	}
+
+	winner, found := trackerRecordFor(result.TrackerData, "BTN")
+	if !found {
+		t.Fatalf("expected BTN fallback id winner record, got %v", result.TrackerData)
+	}
+	if winner.IMDBID == 0 {
+		t.Fatalf("expected BTN imdb id to be set")
+	}
+}
+
+func TestEnrichTrackerDataKeepsDescriptionFromSingleTracker(t *testing.T) {
+	repo := &fakeRepo{}
+	lookup := &stubTrackerLookup{
+		results: map[string]trackerdata.Result{
+			"ANT": {Description: "ant description", TrackerID: "101"},
+			"HDB": {Description: "hdb description", IMDBID: 1554091, TrackerID: "202"},
+		},
+		delays: map[string]time.Duration{
+			"ANT": 5 * time.Millisecond,
+			"HDB": 40 * time.Millisecond,
+		},
+	}
+	cfg := config.Config{
+		Trackers: config.TrackersConfig{
+			Trackers: map[string]config.TrackerConfig{
+				"ANT": {APIKey: "ant-key"},
+				"HDB": {Username: "user", Passkey: "pass"},
+			},
+		},
+	}
+	svc := NewService(repo, WithConfig(cfg), WithTrackerDataLookup(lookup))
+
+	meta := api.PreparedMetadata{
+		SourcePath: `D:\Movies\A.Better.Life.2011.BluRay.1080p.DTS.x264-CHD`,
+		TrackerIDs: map[string]string{
+			"ant": "101",
+			"hdb": "202",
+		},
+	}
+
+	result, err := svc.EnrichTrackerData(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("enrich: %v", err)
+	}
+
+	descriptionTrackers := make([]string, 0)
+	for _, record := range result.TrackerData {
+		if strings.TrimSpace(record.Description) == "" && len(record.ImageURLs) == 0 {
+			continue
+		}
+		descriptionTrackers = append(descriptionTrackers, strings.ToUpper(record.Tracker))
+	}
+	if len(descriptionTrackers) != 1 {
+		t.Fatalf("expected exactly one tracker with description/images, got %d (%v)", len(descriptionTrackers), descriptionTrackers)
+	}
+	if descriptionTrackers[0] != "ANT" {
+		t.Fatalf("expected first completed tracker to keep description/images, got %v", descriptionTrackers)
+	}
+}
+
+func TestMetadataTrackerPriorityInsertsMissingUnit3DBeforeBTN(t *testing.T) {
+	result := trackerPriority
+	oeIdx := indexOfTracker(result, "oe")
+	btnIdx := indexOfTracker(result, "btn")
+	if oeIdx < 0 || btnIdx < 0 || oeIdx >= btnIdx {
+		t.Fatalf("invalid OE/BTN ordering: oe=%d btn=%d list=%v", oeIdx, btnIdx, result)
+	}
+
+	inserted := []string{"a4k", "cbr", "emuw", "fnp", "friki", "hhd", "ihd", "itt", "lcd", "ldu", "lt", "pt", "ptt", "r4e", "ras", "sam", "shri", "stc", "tik", "tlz", "tos", "ttr", "utp"}
+	for _, tracker := range inserted {
+		idx := indexOfTracker(result, tracker)
+		if idx < 0 {
+			t.Fatalf("expected inserted tracker %s in %v", tracker, result)
+		}
+		if idx <= oeIdx || idx >= btnIdx {
+			t.Fatalf("expected %s between OE and BTN, got idx=%d oe=%d btn=%d", tracker, idx, oeIdx, btnIdx)
+		}
+	}
+}
+
+func TestApplyPreferredTrackerMovesTrackerToFront(t *testing.T) {
+	t.Parallel()
+
+	trackers := []string{"BHD", "AITHER", "PTP"}
+	result := applyPreferredTracker(trackers, "ptp")
+	expected := []string{"PTP", "BHD", "AITHER"}
+	if !reflect.DeepEqual(result, expected) {
+		t.Fatalf("expected %v, got %v", expected, result)
+	}
+}
+
+func TestApplyPreferredTrackerNoopForUnknown(t *testing.T) {
+	t.Parallel()
+
+	trackers := []string{"BHD", "AITHER", "PTP"}
+	result := applyPreferredTracker(trackers, "BLU")
+	expected := []string{"BHD", "AITHER", "PTP"}
+	if !reflect.DeepEqual(result, expected) {
+		t.Fatalf("expected %v, got %v", expected, result)
+	}
+}
+
+func indexOfTracker(values []string, target string) int {
+	for idx, value := range values {
+		if strings.EqualFold(value, target) {
+			return idx
+		}
+	}
+	return -1
+}
+
+func TestExtractBTNClaimedShowsParsesCurrentSection(t *testing.T) {
+	t.Parallel()
+
+	html := `
+	<div>
+	  <strong>Current Shows:</strong><br>
+	  Example Show -- BTN<br>
+	  Another Show (aka: Alt Name) -- BTN<br>
+	  Upcoming Shows:<br>
+	  Ignored Show -- BTN
+	</div>`
+
+	claimed := extractBTNClaimedShows(html)
+	if _, ok := claimed[normalizeBTNTitle("Example Show")]; !ok {
+		t.Fatalf("expected example show to be extracted, got %#v", claimed)
+	}
+	if _, ok := claimed[normalizeBTNTitle("Another Show")]; !ok {
+		t.Fatalf("expected canonical title to be extracted, got %#v", claimed)
+	}
+	if _, ok := claimed[normalizeBTNTitle("Alt Name")]; !ok {
+		t.Fatalf("expected AKA alias to be extracted, got %#v", claimed)
+	}
+	if _, ok := claimed[normalizeBTNTitle("Ignored Show")]; ok {
+		t.Fatalf("did not expect shows after upcoming section to be extracted, got %#v", claimed)
+	}
+}
+
+func TestBTNClaimWindowExpiredUsesAiredDateAndTimezone(t *testing.T) {
+	t.Parallel()
+
+	meta := api.PreparedMetadata{
+		TVDBAiredDate:    time.Now().Add(-96 * time.Hour).UTC().Format("2006-01-02"),
+		TVDBAirsTime:     "20:00",
+		TVDBAirsTimezone: "UTC",
+	}
+
+	expired, threshold, _ := btnClaimWindowExpired(meta, 24)
+	if !expired {
+		t.Fatalf("expected claim window to be expired")
+	}
+	if threshold != 48 {
+		t.Fatalf("expected threshold 48h when explicit air time is present, got %d", threshold)
+	}
+
+	meta.TVDBAiredDate = time.Now().Add(-12 * time.Hour).UTC().Format("2006-01-02")
+	expired, threshold, _ = btnClaimWindowExpired(meta, 24)
+	if expired {
+		t.Fatalf("expected claim window to still be active")
+	}
+	if threshold != 48 {
+		t.Fatalf("expected threshold 48h when explicit air time is present, got %d", threshold)
+	}
+}

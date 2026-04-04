@@ -1,0 +1,239 @@
+// Copyright (c) 2025-2026, Audionut and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+package unit3d
+
+import (
+	"html"
+	"net/url"
+	"regexp"
+	"strings"
+	"sync"
+
+	"github.com/autobrr/upbrr/internal/services/imagehost"
+)
+
+var (
+	unit3dURLImgPattern  = regexp.MustCompile(`(?i)\[url=(https?://[^\]]+)\]\[img[^\]]*\](.*?)\[/img\]\[/url\]`)
+	unit3dImgPattern     = regexp.MustCompile(`(?i)\[img[^\]]*\](.*?)\[/img\]`)
+	unit3dWrapperTag     = regexp.MustCompile(`(?is)\[(?:center|align=[^\]]+)\][\s\S]*?\[/(?:center|align)\]`)
+	unit3dParagraphSplit = regexp.MustCompile(`\n\s*\n+`)
+	unit3dSiteLinkCache  sync.Map
+)
+
+func CleanDescription(description string, site string) Report {
+	desc := normalizeNewlines(description)
+	report := Report{}
+	if strings.TrimSpace(desc) == "" {
+		report.Notes = append(report.Notes, Note{Kind: "empty", Message: "blank input"})
+		return report
+	}
+
+	desc = stripSiteLinks(desc, site)
+	report.Description = ""
+	report.Images = selectUnit3DFirstImageSet(desc)
+	return report
+}
+
+func selectUnit3DFirstImageSet(desc string) []Image {
+	segments := unit3dWrapperTag.FindAllString(desc, -1)
+	if len(segments) == 0 {
+		segments = unit3dParagraphSplit.Split(desc, -1)
+	}
+
+	for _, segment := range segments {
+		images := extractUnit3DImages(segment)
+		if len(images) == 0 {
+			continue
+		}
+		if isPosterLikeTopBlock(images) {
+			continue
+		}
+		return images
+	}
+
+	return nil
+}
+
+func extractUnit3DImages(value string) []Image {
+	images := make([]Image, 0)
+	withoutURLBlocks := unit3dURLImgPattern.ReplaceAllStringFunc(value, func(block string) string {
+		parts := unit3dURLImgPattern.FindStringSubmatch(block)
+		if len(parts) < 3 {
+			return block
+		}
+		webURL := strings.TrimSpace(parts[1])
+		imgURL := strings.TrimSpace(parts[2])
+		if imgURL != "" {
+			host := imagehost.ExtractHost(imgURL)
+			rawURL := normalizeRawImageURL(imgURL)
+			images = append(images, Image{ImgURL: imgURL, RawURL: rawURL, WebURL: webURL, Host: host})
+		}
+		return ""
+	})
+
+	withoutURLBlocks = unit3dImgPattern.ReplaceAllStringFunc(withoutURLBlocks, func(block string) string {
+		parts := unit3dImgPattern.FindStringSubmatch(block)
+		if len(parts) < 2 {
+			return block
+		}
+		imgURL := strings.TrimSpace(parts[1])
+		if imgURL != "" && !containsImage(images, imgURL) {
+			host := imagehost.ExtractHost(imgURL)
+			rawURL := normalizeRawImageURL(imgURL)
+			images = append(images, Image{ImgURL: imgURL, RawURL: rawURL, WebURL: imgURL, Host: host})
+		}
+		return ""
+	})
+
+	_ = withoutURLBlocks
+	return filterUnit3DImages(images)
+}
+
+func isPosterLikeTopBlock(images []Image) bool {
+	if len(images) != 1 {
+		return false
+	}
+
+	host := hostFromImage(images[0])
+	if host == "" {
+		return false
+	}
+
+	knownPosterHosts := map[string]struct{}{
+		"image.tmdb.org":     {},
+		"themoviedb.org":     {},
+		"www.themoviedb.org": {},
+	}
+
+	_, found := knownPosterHosts[host]
+	return found
+}
+
+func hostFromImage(image Image) string {
+	selectedURL := strings.TrimSpace(image.RawURL)
+	if selectedURL == "" {
+		selectedURL = strings.TrimSpace(image.ImgURL)
+	}
+	if selectedURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(selectedURL)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+}
+
+func stripSiteLinks(description string, site string) string {
+	parsed, err := url.Parse(site)
+	if err != nil {
+		return description
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if host == "" {
+		return description
+	}
+	pattern := siteLinkPattern(host)
+	return pattern.ReplaceAllString(description, "$1")
+}
+
+func siteLinkPattern(host string) *regexp.Regexp {
+	if cached, ok := unit3dSiteLinkCache.Load(host); ok {
+		return cached.(*regexp.Regexp)
+	}
+	pattern := regexp.MustCompile(`(?i)\[url=https?://(?:www\.)?` + regexp.QuoteMeta(host) + `(?:/[^\]]*)?\]([^\[]+)\[/url\]`)
+	actual, _ := unit3dSiteLinkCache.LoadOrStore(host, pattern)
+	return actual.(*regexp.Regexp)
+}
+
+func containsImage(images []Image, targetURL string) bool {
+	for _, image := range images {
+		if image.ImgURL == targetURL {
+			return true
+		}
+	}
+	return false
+}
+
+func filterUnit3DImages(images []Image) []Image {
+	banned := map[string]struct{}{
+		"https://blutopia.xyz/favicon.ico":       {},
+		"https://i.ibb.co/2NVWb0c/uploadrr.webp": {},
+		"https://blutopia/favicon.ico":           {},
+		"https://ptpimg.me/606tk4.png":           {},
+	}
+
+	filtered := make([]Image, 0, len(images))
+	seen := make(map[string]struct{}, len(images))
+	for _, image := range images {
+		rawURL := normalizeRawImageURL(image.RawURL)
+		if rawURL == "" {
+			rawURL = normalizeRawImageURL(image.ImgURL)
+		}
+		if rawURL != "" {
+			image.RawURL = rawURL
+		}
+		selectedURL := strings.TrimSpace(image.RawURL)
+		if selectedURL == "" {
+			selectedURL = strings.TrimSpace(image.ImgURL)
+		}
+		if selectedURL == "" {
+			continue
+		}
+		if _, found := banned[selectedURL]; found {
+			continue
+		}
+		if strings.Contains(strings.ToLower(selectedURL), "thumbs") {
+			continue
+		}
+		if _, found := seen[selectedURL]; found {
+			continue
+		}
+		seen[selectedURL] = struct{}{}
+		filtered = append(filtered, image)
+	}
+	return filtered
+}
+
+func normalizeNewlines(value string) string {
+	decoded := html.UnescapeString(value)
+	return strings.ReplaceAll(decoded, "\r\n", "\n")
+}
+
+func normalizeRawImageURL(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return trimmed
+	}
+
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	pathValue := strings.TrimSpace(parsed.Path)
+
+	if strings.Contains(host, "imgbox.com") && strings.Contains(host, "thumbs") {
+		parsed.Host = strings.ReplaceAll(parsed.Host, "thumbs2.imgbox.com", "images2.imgbox.com")
+		parsed.Path = strings.ReplaceAll(parsed.Path, "_t.png", "_o.png")
+		parsed.Path = strings.ReplaceAll(parsed.Path, "_t.jpg", "_o.jpg")
+		parsed.Path = strings.ReplaceAll(parsed.Path, "_t.jpeg", "_o.jpeg")
+		return parsed.String()
+	}
+
+	if strings.HasSuffix(host, "pixhost.to") && strings.HasPrefix(pathValue, "/thumbs/") {
+		hostParts := strings.SplitN(host, ".", 2)
+		if len(hostParts) == 2 {
+			first := hostParts[0]
+			if strings.HasPrefix(first, "t") && len(first) > 1 {
+				number := strings.TrimPrefix(first, "t")
+				parsed.Host = strings.Replace(parsed.Host, "t"+number+".", "img"+number+".", 1)
+			}
+		}
+		parsed.Path = strings.Replace(pathValue, "/thumbs/", "/images/", 1)
+		return parsed.String()
+	}
+
+	return trimmed
+}

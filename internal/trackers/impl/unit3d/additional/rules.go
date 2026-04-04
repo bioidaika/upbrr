@@ -1,0 +1,238 @@
+// Copyright (c) 2025-2026, Audionut and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+package additional
+
+import "strings"
+
+var (
+	languagesEnglish = []string{"english", "en", "eng"}
+	languagesFrench  = []string{"french", "fr", "fra", "fre"}
+	languagesSpanish = []string{"spanish", "es", "spa"}
+	languagesNordic  = []string{
+		"english",
+		"norwegian",
+		"norsk",
+		"no",
+		"nb",
+		"nn",
+		"swedish",
+		"sv",
+		"danish",
+		"da",
+		"finnish",
+		"fi",
+		"icelandic",
+		"is",
+	}
+)
+
+var trackerRuleFactories = map[string]func() RuleSet{
+	"AITHER": rulesAITHER,
+	"ANT":    rulesANT,
+	"A4K":    rulesA4K,
+	"DP":     rulesDP,
+	"HHD":    rulesHHD,
+	"HUNO":   rulesHUNO,
+	"LST":    rulesLST,
+	"LUME":   rulesLUME,
+	"OE":     rulesOE,
+	"OTW":    rulesOTW,
+	"RAS":    rulesRAS,
+	"RF":     rulesRF,
+	"SHRI":   rulesSHRI,
+	"SP":     rulesSP,
+	"STC":    rulesSTC,
+	"TIK":    rulesTIK,
+	"TOS":    rulesTOS,
+	"TTR":    rulesTTR,
+	"ULCX":   rulesULCX,
+	"NBL":    rulesNBL,
+}
+
+func RulesFor(tracker string) (RuleSet, bool) {
+	key := strings.ToUpper(strings.TrimSpace(tracker))
+	factory, ok := trackerRuleFactories[key]
+	if !ok {
+		return RuleSet{}, false
+	}
+	return factory(), true
+}
+
+func nonDiscEnglishAudioSubsRule() *LanguageRule {
+	return &LanguageRule{
+		Languages:      languagesEnglish,
+		RequireAudio:   true,
+		RequireSubs:    true,
+		AllowOriginal:  true,
+		ApplyIfNonDisc: true,
+	}
+}
+
+func rulesAITHER() RuleSet {
+	return RuleSet{
+		RequireUniqueID: true,
+		Language:        nonDiscEnglishAudioSubsRule(),
+	}
+}
+
+func rulesANT() RuleSet {
+	return RuleSet{RequireMovieOnly: true}
+}
+
+func rulesA4K() RuleSet {
+	return RuleSet{Language: nonDiscEnglishAudioSubsRule()}
+}
+
+func rulesHHD() RuleSet {
+	return RuleSet{BlockDVDRip: true}
+}
+
+func rulesLST() RuleSet {
+	return RuleSet{
+		RequireValidMISetting: true,
+		Language:              nonDiscEnglishAudioSubsRule(),
+	}
+}
+
+func rulesTIK() RuleSet {
+	return RuleSet{RequireDiscOnly: true}
+}
+
+func rulesNBL() RuleSet {
+	return RuleSet{
+		RequireTVOnly: true,
+		Language:      nonDiscEnglishAudioSubsRule(),
+	}
+}
+
+func rulesDP() RuleSet {
+	return RuleSet{
+		BlockSingleFileFolder: true,
+		BlockHardcodedSubs:    true,
+		BlockGroups:           []string{"FGT"},
+		BlockGroupUnlessType:  map[string][]string{"EVO": {"WEBDL"}},
+		Language: &LanguageRule{
+			Languages:    languagesNordic,
+			RequireAudio: true,
+			RequireSubs:  true,
+		},
+	}
+}
+
+func rulesHUNO() RuleSet {
+	return RuleSet{
+		RequireValidMISetting: true,
+		RequireAudioLanguages: true,
+		RequireHEVCForTypes:   []string{"ENCODE", "WEBRIP", "DVDRIP", "HDTV"},
+		ExtraCheck:            checkHUNOEncoding,
+	}
+}
+
+func rulesLUME() RuleSet {
+	return RuleSet{
+		RequireValidMISetting: true,
+		BlockAdult:            true,
+		AdultMessage:          "Porn is not allowed on LUME.",
+		Language: &LanguageRule{
+			Languages:      languagesEnglish,
+			RequireAudio:   true,
+			RequireSubs:    true,
+			AllowOriginal:  true,
+			ApplyIfNonDisc: true,
+		},
+		ExtraCheck: checkLUMEResolution,
+	}
+}
+
+func rulesOE() RuleSet {
+	return RuleSet{
+		BlockAdult:   true,
+		AdultMessage: "Porn is not allowed",
+		Language: &LanguageRule{
+			Languages:      languagesEnglish,
+			RequireAudio:   true,
+			RequireSubs:    true,
+			ApplyIfNonDisc: true,
+		},
+	}
+}
+
+func rulesOTW() RuleSet {
+	return RuleSet{ExtraCheck: checkOTWGenres}
+}
+
+func rulesRAS() RuleSet {
+	return RuleSet{
+		Language: &LanguageRule{
+			Languages:    languagesNordic,
+			RequireAudio: true,
+			RequireSubs:  true,
+		},
+	}
+}
+
+func rulesRF() RuleSet {
+	return RuleSet{
+		BlockAdult:       true,
+		AdultMessage:     "Porn is not allowed",
+		RequireMovieOnly: true,
+	}
+}
+
+func rulesSHRI() RuleSet {
+	return RuleSet{ExtraCheck: checkSHRIRegion}
+}
+
+func rulesSP() RuleSet {
+	return RuleSet{
+		BlockAdult:    true,
+		AdultMessage:  "Porn is not allowed",
+		MinResolution: "1080p",
+	}
+}
+
+func rulesSTC() RuleSet {
+	return RuleSet{
+		BlockAdult:    true,
+		AdultMessage:  "Porn is not allowed",
+		RequireTVOnly: true,
+	}
+}
+
+func rulesTOS() RuleSet {
+	return RuleSet{
+		Language: &LanguageRule{
+			Languages:     languagesFrench,
+			RequireAudio:  true,
+			RequireSubs:   true,
+			AllowOriginal: true,
+		},
+		RequireSceneNFO: true,
+	}
+}
+
+func rulesTTR() RuleSet {
+	return RuleSet{
+		Language: &LanguageRule{
+			Languages:    languagesSpanish,
+			RequireAudio: true,
+			RequireSubs:  true,
+		},
+		ExtraCheck: checkTTRSubtitleOnly,
+	}
+}
+
+func rulesULCX() RuleSet {
+	return RuleSet{
+		RequireValidMISetting: true,
+		BlockDVDRip:           true,
+		Language: &LanguageRule{
+			Languages:      languagesEnglish,
+			RequireAudio:   true,
+			RequireSubs:    true,
+			ApplyIfNonDisc: true,
+		},
+		ExtraCheck: checkULCXRules,
+	}
+}

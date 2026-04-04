@@ -1,0 +1,183 @@
+// Copyright (c) 2025-2026, Audionut and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+package redaction
+
+import (
+	"encoding/json"
+	"regexp"
+	"strings"
+)
+
+type Block struct {
+	Start int
+	End   int
+}
+
+var DefaultSensitiveKeys = map[string]struct{}{
+	"token":         {},
+	"passkey":       {},
+	"password":      {},
+	"auth":          {},
+	"cookie":        {},
+	"csrf":          {},
+	"email":         {},
+	"username":      {},
+	"user":          {},
+	"key":           {},
+	"info_hash":     {},
+	"anticsrftoken": {},
+	"torrent_pass":  {},
+	"popcron":       {},
+}
+
+var (
+	passkeyPathRe  = regexp.MustCompile(`/([A-Za-z0-9]{10,})(/announce)`) // /<passkey>/announce
+	proxyPathRe    = regexp.MustCompile(`/proxy/([^/]+)(/api)`)           // /proxy/<secret>/api
+	queryParamRe   = regexp.MustCompile(`(?i)([?&](passkey|key|token|auth|info_hash|torrent_pass)=)[^&]+`)
+	longHexTokenRe = regexp.MustCompile(`\b[a-fA-F0-9]{32,}\b`)
+)
+
+// ExtractJSONBlocks returns candidate JSON substrings based on bracket counting.
+func ExtractJSONBlocks(text string) []Block {
+	blocks := make([]Block, 0)
+	stack := make([]rune, 0)
+	start := -1
+	inString := false
+	var stringChar rune
+	escape := false
+
+	for idx, ch := range text {
+		if escape {
+			escape = false
+			continue
+		}
+
+		if inString {
+			if ch == '\\' {
+				escape = true
+				continue
+			}
+			if ch == stringChar {
+				inString = false
+			}
+			continue
+		}
+
+		if ch == '"' || ch == '\'' {
+			inString = true
+			stringChar = ch
+			continue
+		}
+
+		if ch == '{' || ch == '[' {
+			if len(stack) == 0 {
+				start = idx
+			}
+			stack = append(stack, ch)
+			continue
+		}
+
+		if (ch == '}' || ch == ']') && len(stack) > 0 {
+			top := stack[len(stack)-1]
+			if (ch == '}' && top == '{') || (ch == ']' && top == '[') {
+				stack = stack[:len(stack)-1]
+				if len(stack) == 0 && start >= 0 {
+					blocks = append(blocks, Block{Start: start, End: idx + 1})
+					start = -1
+				}
+			}
+		}
+	}
+
+	return blocks
+}
+
+// RedactValue redacts sensitive content in a string.
+func RedactValue(value string, sensitiveKeys map[string]struct{}) string {
+	keys := sensitiveKeys
+	if keys == nil {
+		keys = DefaultSensitiveKeys
+	}
+
+	blocks := ExtractJSONBlocks(value)
+	if len(blocks) > 0 {
+		for i := len(blocks) - 1; i >= 0; i-- {
+			block := blocks[i]
+			if block.Start < 0 || block.End > len(value) || block.Start >= block.End {
+				continue
+			}
+			segment := value[block.Start:block.End]
+			var parsed any
+			if err := json.Unmarshal([]byte(segment), &parsed); err != nil {
+				continue
+			}
+			redacted := RedactPrivateInfo(parsed, keys)
+			data, err := json.Marshal(redacted)
+			if err != nil {
+				continue
+			}
+			value = value[:block.Start] + string(data) + value[block.End:]
+		}
+	}
+
+	value = passkeyPathRe.ReplaceAllString(value, `/[REDACTED]$2`)
+	value = proxyPathRe.ReplaceAllString(value, `/proxy/[REDACTED]$2`)
+	value = queryParamRe.ReplaceAllString(value, `${1}[REDACTED]`)
+	value = longHexTokenRe.ReplaceAllString(value, `[REDACTED]`)
+
+	_ = keys
+	return value
+}
+
+// RedactPrivateInfo recursively redacts sensitive values in JSON-like data.
+func RedactPrivateInfo(data any, sensitiveKeys map[string]struct{}) any {
+	keys := sensitiveKeys
+	if keys == nil {
+		keys = DefaultSensitiveKeys
+	}
+
+	switch typed := data.(type) {
+	case map[string]any:
+		redacted := make(map[string]any, len(typed))
+		for key, value := range typed {
+			if isSensitiveKey(key, keys) {
+				redacted[key] = "[REDACTED]"
+				continue
+			}
+			redacted[key] = RedactPrivateInfo(value, keys)
+		}
+		return redacted
+	case []any:
+		redacted := make([]any, 0, len(typed))
+		for _, value := range typed {
+			redacted = append(redacted, RedactPrivateInfo(value, keys))
+		}
+		return redacted
+	case string:
+		var parsed any
+		if err := json.Unmarshal([]byte(typed), &parsed); err == nil {
+			redacted := RedactPrivateInfo(parsed, keys)
+			data, err := json.Marshal(redacted)
+			if err == nil {
+				return string(data)
+			}
+		}
+		return RedactValue(typed, keys)
+	default:
+		return data
+	}
+}
+
+func isSensitiveKey(key string, keys map[string]struct{}) bool {
+	if len(keys) == 0 {
+		return false
+	}
+	lower := strings.ToLower(key)
+	for candidate := range keys {
+		if strings.Contains(lower, candidate) {
+			return true
+		}
+	}
+	return false
+}

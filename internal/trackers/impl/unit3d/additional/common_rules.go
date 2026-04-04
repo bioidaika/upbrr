@@ -1,0 +1,388 @@
+// Copyright (c) 2025-2026, Audionut and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+package additional
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"regexp"
+	"strings"
+
+	"github.com/autobrr/upbrr/pkg/api"
+)
+
+var resolutionOrder = map[string]int{
+	"480i":  1,
+	"480p":  2,
+	"576i":  3,
+	"576p":  4,
+	"720p":  5,
+	"1080i": 6,
+	"1080p": 7,
+	"1440p": 8,
+	"2160p": 9,
+	"4320p": 10,
+	"8640p": 11,
+}
+
+var crfPattern = regexp.MustCompile(`(?i)crf[ =:]+([\d.]+)`) // best-effort parse
+
+func checkHUNOEncoding(ctx context.Context, meta api.PreparedMetadata, logger api.Logger) Result {
+	select {
+	case <-ctx.Done():
+		return Fail(ctx.Err().Error())
+	default:
+	}
+
+	if isDiscType(meta.DiscType) {
+		return Pass()
+	}
+
+	typeValue := resolveType(meta)
+	if typeValue != "ENCODE" && typeValue != "WEBRIP" && typeValue != "DVDRIP" && typeValue != "HDTV" {
+		return Pass()
+	}
+
+	payload, err := loadMediaInfoJSON(meta.MediaInfoJSONPath)
+	if err != nil {
+		if logger != nil {
+			logger.Debugf("unit3d: huno mediainfo read failed: %v", err)
+		}
+		return Pass()
+	}
+
+	videoTrack := firstMediaInfoTrack(payload, "Video")
+	if videoTrack == nil {
+		return Pass()
+	}
+
+	encoding := trackString(videoTrack, "Encoded_Library_Settings")
+	if strings.TrimSpace(encoding) != "" {
+		match := crfPattern.FindStringSubmatch(encoding)
+		if len(match) > 1 {
+			if crfValue := parseFloat(match[1]); crfValue > 22 {
+				return Fail(fmt.Sprintf("CRF value too high: %.2f for HUNO", crfValue))
+			}
+		}
+		return Pass()
+	}
+
+	bitRateRaw := trackString(videoTrack, "BitRate", "BitRate_String")
+	bitRate := parseInt(bitRateRaw)
+	if bitRate == 0 {
+		return Pass()
+	}
+	bitRateKbps := float64(bitRate) / 1000.0
+	if bitRateKbps < 3000 && !isAnimation(meta) {
+		return Fail(fmt.Sprintf("Video bitrate too low: %.0f kbps for HUNO", bitRateKbps))
+	}
+	return Pass()
+}
+
+func checkLUMEResolution(ctx context.Context, meta api.PreparedMetadata, logger api.Logger) Result {
+	select {
+	case <-ctx.Done():
+		return Fail(ctx.Err().Error())
+	default:
+	}
+
+	if isDiscType(meta.DiscType) {
+		return Pass()
+	}
+
+	resolution := resolveResolution(meta)
+	if resolution == "" {
+		return Fail("LUME requires a known resolution")
+	}
+	if resolutionOrder[resolution] < resolutionOrder["720p"] {
+		return Fail("LUME only allows SD releases when the content does not have a higher resolution release.")
+	}
+	return Pass()
+}
+
+func checkOTWGenres(ctx context.Context, meta api.PreparedMetadata, logger api.Logger) Result {
+	select {
+	case <-ctx.Done():
+		return Fail(ctx.Err().Error())
+	default:
+	}
+
+	genres := collectGenres(meta)
+	if !containsAny(genres, []string{"animation", "family"}) {
+		return Fail("Genre does not match Animation or Family for OTW.")
+	}
+
+	if isAdultContent(meta) {
+		return Fail("Adult animation not allowed at OTW.")
+	}
+
+	if containsAny(genres, []string{"reality", "game show", "game-show", "reality tv", "reality television"}) {
+		return Fail("Reality / Game Show content not allowed at OTW.")
+	}
+
+	typeValue := resolveType(meta)
+	group := resolveGroup(meta)
+	if group != "" && typeValue != "WEBDL" && !isDiscType(meta.DiscType) {
+		restricted := map[string]bool{"CMRG": true, "EVO": true, "TERMINAL": true, "VISION": true}
+		if restricted[strings.ToUpper(group)] {
+			return Fail(fmt.Sprintf("Group %s is only allowed for raw type content at OTW", group))
+		}
+	}
+
+	return Pass()
+}
+
+func checkSHRIRegion(ctx context.Context, meta api.PreparedMetadata, logger api.Logger) Result {
+	select {
+	case <-ctx.Done():
+		return Fail(ctx.Err().Error())
+	default:
+	}
+
+	if !strings.EqualFold(strings.TrimSpace(meta.DiscType), "DVD") && !strings.EqualFold(strings.TrimSpace(meta.DiscType), "HDDVD") {
+		return Pass()
+	}
+	if strings.TrimSpace(meta.Region) == "" {
+		return Fail("Region required; skipping SHRI.")
+	}
+	return Pass()
+}
+
+func checkTTRSubtitleOnly(ctx context.Context, meta api.PreparedMetadata, logger api.Logger) Result {
+	select {
+	case <-ctx.Done():
+		return Fail(ctx.Err().Error())
+	default:
+	}
+
+	if !containsAny(normalizeStrings(meta.Release.Language), []string{"spanish", "es", "spa"}) {
+		return Fail("TTR requires at least one Spanish audio or subtitle track.")
+	}
+	return Pass()
+}
+
+func checkULCXRules(ctx context.Context, meta api.PreparedMetadata, logger api.Logger) Result {
+	select {
+	case <-ctx.Done():
+		return Fail(ctx.Err().Error())
+	default:
+	}
+
+	keywords := collectKeywords(meta)
+	if containsAny(keywords, []string{"concert"}) {
+		return Fail("Concerts not allowed at ULCX.")
+	}
+
+	resolution := resolveResolution(meta)
+	if strings.EqualFold(strings.TrimSpace(meta.VideoCodec), "HEVC") && resolution != "2160p" && !isAnimation(meta) && !isAnime(meta) {
+		return Fail("This content might not fit HEVC rules for ULCX.")
+	}
+
+	typeValue := resolveType(meta)
+	if (typeValue == "ENCODE" || typeValue == "HDTV") && resolutionOrder[resolution] < resolutionOrder["720p"] {
+		return Fail("Encodes must be at least 720p resolution for ULCX.")
+	}
+
+	if typeValue == "DVDRIP" {
+		return Fail("DVDRIPs are not allowed for ULCX.")
+	}
+
+	return Pass()
+}
+
+func resolveResolution(meta api.PreparedMetadata) string {
+	resolution := strings.TrimSpace(meta.Release.Resolution)
+	if resolution == "" {
+		resolution = detectResolution(meta.ReleaseName)
+	}
+	return resolution
+}
+
+func detectResolution(value string) string {
+	clean := strings.ToLower(value)
+	for _, candidate := range []string{"8640p", "4320p", "2160p", "1440p", "1080p", "1080i", "720p", "576p", "576i", "480p", "480i"} {
+		if strings.Contains(clean, candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func resolveType(meta api.PreparedMetadata) string {
+	typeValue := strings.ToUpper(strings.TrimSpace(meta.Type))
+	if typeValue == "" {
+		typeValue = strings.ToUpper(strings.TrimSpace(meta.Release.Type))
+	}
+	return typeValue
+}
+
+func resolveGroup(meta api.PreparedMetadata) string {
+	if group := strings.TrimSpace(meta.Release.Group); group != "" {
+		return group
+	}
+	return strings.TrimPrefix(strings.TrimSpace(meta.Tag), "-")
+}
+
+func isDiscType(value string) bool {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "BDMV", "DVD", "HDDVD":
+		return true
+	default:
+		return false
+	}
+}
+
+func isAdultContent(meta api.PreparedMetadata) bool {
+	candidates := append([]string{}, collectGenres(meta)...)
+	candidates = append(candidates, collectKeywords(meta)...)
+	for _, token := range candidates {
+		switch strings.ToLower(strings.TrimSpace(token)) {
+		case "adult", "porn", "pornography", "xxx", "erotic":
+			return true
+		}
+	}
+	return false
+}
+
+func isAnime(meta api.PreparedMetadata) bool {
+	if meta.ExternalMetadata.TMDB != nil && meta.ExternalMetadata.TMDB.Anime {
+		return true
+	}
+	return containsAny(collectKeywords(meta), []string{"anime"})
+}
+
+func isAnimation(meta api.PreparedMetadata) bool {
+	return containsAny(collectGenres(meta), []string{"animation"})
+}
+
+func collectGenres(meta api.PreparedMetadata) []string {
+	values := []string{}
+	values = append(values, splitList(meta.Release.Genre)...)
+	if meta.ExternalMetadata.TMDB != nil {
+		values = append(values, splitList(meta.ExternalMetadata.TMDB.Genres)...)
+	}
+	if meta.ExternalMetadata.IMDB != nil {
+		values = append(values, splitList(meta.ExternalMetadata.IMDB.Genres)...)
+	}
+	return normalizeStrings(values)
+}
+
+func collectKeywords(meta api.PreparedMetadata) []string {
+	values := []string{}
+	if meta.ExternalMetadata.TMDB != nil {
+		values = append(values, splitList(meta.ExternalMetadata.TMDB.Keywords)...)
+	}
+	return normalizeStrings(values)
+}
+
+func splitList(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func normalizeStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, value := range values {
+		trimmed := strings.ToLower(strings.TrimSpace(value))
+		if trimmed == "" || seen[trimmed] {
+			continue
+		}
+		seen[trimmed] = true
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+func containsAny(values []string, targets []string) bool {
+	if len(values) == 0 || len(targets) == 0 {
+		return false
+	}
+	targetSet := make(map[string]bool, len(targets))
+	for _, target := range targets {
+		targetSet[strings.ToLower(strings.TrimSpace(target))] = true
+	}
+	for _, value := range values {
+		if targetSet[strings.ToLower(strings.TrimSpace(value))] {
+			return true
+		}
+	}
+	return false
+}
+
+type mediaInfoDoc struct {
+	Media struct {
+		Tracks []map[string]any `json:"track"`
+	} `json:"media"`
+}
+
+func loadMediaInfoJSON(path string) (mediaInfoDoc, error) {
+	if strings.TrimSpace(path) == "" {
+		return mediaInfoDoc{}, errors.New("mediainfo json path empty")
+	}
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return mediaInfoDoc{}, err
+	}
+	var doc mediaInfoDoc
+	if err := json.Unmarshal(payload, &doc); err != nil {
+		return mediaInfoDoc{}, err
+	}
+	return doc, nil
+}
+
+func firstMediaInfoTrack(doc mediaInfoDoc, trackType string) map[string]any {
+	for _, track := range doc.Media.Tracks {
+		if strings.EqualFold(trackString(track, "@type"), trackType) {
+			return track
+		}
+	}
+	return nil
+}
+
+func trackString(track map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := track[key]; ok {
+			if s, ok := value.(string); ok {
+				if strings.TrimSpace(s) != "" {
+					return s
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func parseFloat(value string) float64 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	var parsed float64
+	_, _ = fmt.Sscanf(value, "%f", &parsed)
+	return parsed
+}
+
+func parseInt(value string) int64 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	var parsed int64
+	_, _ = fmt.Sscanf(value, "%d", &parsed)
+	return parsed
+}

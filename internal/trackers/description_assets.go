@@ -1,0 +1,471 @@
+// Copyright (c) 2025-2026, Audionut and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+package trackers
+
+import (
+	"context"
+	"errors"
+	"regexp"
+	"sort"
+	"strings"
+
+	internalerrors "github.com/autobrr/upbrr/internal/errors"
+	"github.com/autobrr/upbrr/internal/services/imagehost"
+	"github.com/autobrr/upbrr/pkg/api"
+)
+
+type DescriptionAssets struct {
+	Description string
+	Screenshots []api.ScreenshotImage
+	Slots       []api.ScreenshotSlot
+	Override    bool
+}
+
+var embeddedNFOBlockPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?is)\[(?:center|align=center)\]\s*\[spoiler=.*? nfo:\]\[code\].*?\[/code\]\[/spoiler\]\s*\[/(?:center|align)\]`),
+	regexp.MustCompile(`(?is)\[hide=(?:Scene|FraMeSToR) NFO:\]\[pre\].*?\[/pre\]\[/hide\]`),
+}
+
+var descriptionSpacingPattern = regexp.MustCompile(`\n{3,}`)
+var defaultSignaturePattern = regexp.MustCompile(`(?is)\[(?:right|align=right)\]\s*\[url=https://github\.com/(?:Audionut|autobrr)/upbrr\].*?\[/url\]\s*\[/(?:right|align)\]`)
+
+type preloadedDescriptionAssetData struct {
+	descriptionOverride      api.DescriptionOverride
+	descriptionOverrideFound bool
+	trackerRecords           []api.TrackerMetadata
+	selections               []api.ScreenshotFinalSelection
+	uploads                  []api.UploadedImageLink
+	screenshotSlots          []api.ScreenshotSlot
+	screenshotSlotsLoaded    bool
+}
+
+func ResolveDescriptionAssets(ctx context.Context, tracker string, meta api.PreparedMetadata, repo api.MetadataRepository, logger api.Logger) (DescriptionAssets, error) {
+	return resolveDescriptionAssets(ctx, tracker, meta, repo, logger, nil)
+}
+
+func resolveDescriptionAssets(ctx context.Context, tracker string, meta api.PreparedMetadata, repo api.MetadataRepository, logger api.Logger, preloaded *preloadedDescriptionAssetData) (DescriptionAssets, error) {
+	if err := ctx.Err(); err != nil {
+		return DescriptionAssets{}, err
+	}
+	if repo == nil || strings.TrimSpace(meta.SourcePath) == "" {
+		description := sanitizeTrackerDescription(tracker, meta.DescriptionOverride)
+		return DescriptionAssets{Description: description, Override: strings.TrimSpace(description) != ""}, nil
+	}
+	if logger != nil {
+		logger.Debugf("trackers: description assets start tracker=%s source=%s", strings.TrimSpace(tracker), meta.SourcePath)
+	}
+
+	description, overridden := resolveTrackerDescription(ctx, tracker, meta, repo, logger, preloaded)
+	slots, screenshots, err := resolveDescriptionScreenshots(ctx, tracker, meta, repo, logger, preloaded)
+	if err != nil {
+		if logger != nil {
+			logger.Warnf("trackers: description assets screenshots degraded for %s: %v", strings.TrimSpace(tracker), err)
+		}
+		slots = nil
+		screenshots = nil
+	}
+	if logger != nil {
+		logger.Debugf("trackers: description assets resolved desc_len=%d screenshots=%d", len(strings.TrimSpace(description)), len(screenshots))
+	}
+	return DescriptionAssets{Description: sanitizeTrackerDescription(tracker, description), Screenshots: screenshots, Slots: slots, Override: overridden}, nil
+}
+
+func resolveTrackerDescription(ctx context.Context, tracker string, meta api.PreparedMetadata, repo api.MetadataRepository, logger api.Logger, preloaded *preloadedDescriptionAssetData) (string, bool) {
+	if err := ctx.Err(); err != nil {
+		return "", false
+	}
+	if trimmed := strings.TrimSpace(meta.DescriptionOverride); trimmed != "" {
+		if logger != nil {
+			logger.Debugf("trackers: request description override applied source=%s len=%d", meta.SourcePath, len(trimmed))
+		}
+		return meta.DescriptionOverride, true
+	}
+	if repo != nil && strings.TrimSpace(meta.SourcePath) != "" {
+		override, err := descriptionOverrideFromSource(ctx, meta, repo, preloaded)
+		if err == nil {
+			trimmed := strings.TrimSpace(override.Description)
+			if trimmed != "" {
+				if logger != nil {
+					logger.Debugf("trackers: description override applied source=%s len=%d", meta.SourcePath, len(trimmed))
+				}
+				return override.Description, true
+			}
+		} else if !errors.Is(err, internalerrors.ErrNotFound) {
+			if logger != nil {
+				logger.Debugf("trackers: description override lookup failed: %v", err)
+			}
+		}
+	}
+	records, err := trackerMetadataFromSource(ctx, meta, repo, preloaded)
+	if err != nil {
+		if logger != nil {
+			logger.Debugf("trackers: description assets failed to load tracker metadata: %v", err)
+		}
+		records = nil
+	}
+	combined := mergeTrackerMetadata(records, meta.TrackerData)
+	if filtered := filterTrackerMetadataByName(combined, tracker); len(filtered) > 0 {
+		combined = filtered
+	}
+	result := combineDescriptions(combined)
+	if logger != nil {
+		logger.Debugf("trackers: description assets description sources db=%d meta=%d combined=%d desc_len=%d", len(records), len(meta.TrackerData), len(combined), len(strings.TrimSpace(result)))
+	}
+	return result, false
+}
+
+func mergeTrackerMetadata(primary []api.TrackerMetadata, fallback []api.TrackerMetadata) []api.TrackerMetadata {
+	if len(primary) == 0 && len(fallback) == 0 {
+		return nil
+	}
+	combined := make([]api.TrackerMetadata, 0, len(primary)+len(fallback))
+	combined = append(combined, primary...)
+	combined = append(combined, fallback...)
+	return combined
+}
+
+func resolveDescriptionScreenshots(ctx context.Context, tracker string, meta api.PreparedMetadata, repo api.MetadataRepository, logger api.Logger, preloaded *preloadedDescriptionAssetData) ([]api.ScreenshotSlot, []api.ScreenshotImage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	slots, err := screenshotSlotsFromSource(ctx, tracker, meta, repo, logger, preloaded)
+	if err != nil {
+		if logger != nil {
+			logger.Debugf("trackers: description assets failed to load screenshot slots: %v", err)
+		}
+		slots = nil
+	}
+	images, _, _, err := selectScreenshotsFromSlots(tracker, slots, imageHostPolicy{})
+	if err != nil {
+		if logger != nil {
+			logger.Warnf("trackers: description assets slot screenshot resolution failed tracker=%s: %v", strings.TrimSpace(tracker), err)
+		}
+		images = nil
+	}
+	if len(images) > 0 {
+		if logger != nil {
+			logger.Debugf("trackers: description assets screenshots source=slots slots=%d resolved=%d", len(slots), len(images))
+		}
+		return slots, images, nil
+	}
+
+	urls := resolveTrackerImageURLs(ctx, tracker, meta, repo, logger, preloaded)
+	if logger != nil {
+		logger.Debugf("trackers: description assets screenshots source=tracker_urls tracker=%s urls=%d", strings.TrimSpace(tracker), len(urls))
+	}
+	return nil, resolveTrackerScreenshots(urls), nil
+}
+
+func preloadDescriptionAssetData(ctx context.Context, meta api.PreparedMetadata, repo api.MetadataRepository) (*preloadedDescriptionAssetData, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if repo == nil || strings.TrimSpace(meta.SourcePath) == "" {
+		return nil, nil
+	}
+
+	preloaded := &preloadedDescriptionAssetData{}
+
+	override, err := repo.GetDescriptionOverride(ctx, meta.SourcePath)
+	switch {
+	case err == nil:
+		preloaded.descriptionOverride = override
+		preloaded.descriptionOverrideFound = true
+	case errors.Is(err, internalerrors.ErrNotFound):
+	default:
+		return nil, err
+	}
+
+	trackerRecords, err := repo.ListTrackerMetadataByPath(ctx, meta.SourcePath)
+	if err != nil {
+		return nil, err
+	}
+	preloaded.trackerRecords = trackerRecords
+
+	selections, err := repo.ListFinalSelections(ctx, meta.SourcePath)
+	if err != nil {
+		return nil, err
+	}
+	preloaded.selections = selections
+
+	uploads, err := repo.ListUploadedImagesByPath(ctx, meta.SourcePath)
+	if err != nil {
+		return nil, err
+	}
+	preloaded.uploads = uploads
+
+	slots, err := screenshotSlotsFromSource(ctx, "", meta, repo, nil, preloaded)
+	if err != nil {
+		return nil, err
+	}
+	preloaded.screenshotSlots = slots
+	preloaded.screenshotSlotsLoaded = true
+
+	return preloaded, nil
+}
+
+func descriptionOverrideFromSource(ctx context.Context, meta api.PreparedMetadata, repo api.MetadataRepository, preloaded *preloadedDescriptionAssetData) (api.DescriptionOverride, error) {
+	if err := ctx.Err(); err != nil {
+		return api.DescriptionOverride{}, err
+	}
+	if preloaded != nil {
+		if preloaded.descriptionOverrideFound {
+			return preloaded.descriptionOverride, nil
+		}
+		return api.DescriptionOverride{}, internalerrors.ErrNotFound
+	}
+	return repo.GetDescriptionOverride(ctx, meta.SourcePath)
+}
+
+func trackerMetadataFromSource(ctx context.Context, meta api.PreparedMetadata, repo api.MetadataRepository, preloaded *preloadedDescriptionAssetData) ([]api.TrackerMetadata, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if preloaded != nil {
+		return preloaded.trackerRecords, nil
+	}
+	return repo.ListTrackerMetadataByPath(ctx, meta.SourcePath)
+}
+
+func finalSelectionsFromSource(ctx context.Context, meta api.PreparedMetadata, repo api.MetadataRepository, preloaded *preloadedDescriptionAssetData) ([]api.ScreenshotFinalSelection, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if preloaded != nil {
+		return preloaded.selections, nil
+	}
+	return repo.ListFinalSelections(ctx, meta.SourcePath)
+}
+
+func uploadedImagesFromSource(ctx context.Context, meta api.PreparedMetadata, repo api.MetadataRepository, preloaded *preloadedDescriptionAssetData) ([]api.UploadedImageLink, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if preloaded != nil {
+		return preloaded.uploads, nil
+	}
+	return repo.ListUploadedImagesByPath(ctx, meta.SourcePath)
+}
+
+func resolveTrackerImageURLs(ctx context.Context, tracker string, meta api.PreparedMetadata, repo api.MetadataRepository, logger api.Logger, preloaded *preloadedDescriptionAssetData) []string {
+	if err := ctx.Err(); err != nil {
+		return nil
+	}
+	trackerKey := strings.TrimSpace(tracker)
+	records, err := trackerMetadataFromSource(ctx, meta, repo, preloaded)
+	if err == nil {
+		if len(records) > 0 {
+			if trackerKey != "" {
+				filtered := filterTrackerMetadataByName(records, trackerKey)
+				if len(filtered) > 0 {
+					if logger != nil {
+						logger.Debugf("trackers: description assets tracker urls source=db tracker=%s records=%d filtered=%d", trackerKey, len(records), len(filtered))
+					}
+					return collectImageURLs(filtered)
+				}
+			}
+			if logger != nil {
+				logger.Debugf("trackers: description assets tracker urls source=db tracker=%s records=%d", trackerKey, len(records))
+			}
+			return collectImageURLs(records)
+		}
+	} else if logger != nil {
+		logger.Debugf("trackers: description assets failed to load tracker image urls: %v", err)
+	}
+	if trackerKey != "" {
+		filtered := filterTrackerMetadataByName(meta.TrackerData, trackerKey)
+		if len(filtered) > 0 {
+			if logger != nil {
+				logger.Debugf("trackers: description assets tracker urls source=meta tracker=%s records=%d filtered=%d", trackerKey, len(meta.TrackerData), len(filtered))
+			}
+			return collectImageURLs(filtered)
+		}
+	}
+	if logger != nil {
+		logger.Debugf("trackers: description assets tracker urls source=meta tracker=%s records=%d", trackerKey, len(meta.TrackerData))
+	}
+	return collectImageURLs(meta.TrackerData)
+}
+
+func filterTrackerMetadataByName(records []api.TrackerMetadata, tracker string) []api.TrackerMetadata {
+	if len(records) == 0 || strings.TrimSpace(tracker) == "" {
+		return nil
+	}
+	needle := strings.ToUpper(strings.TrimSpace(tracker))
+	filtered := make([]api.TrackerMetadata, 0, len(records))
+	for _, record := range records {
+		if strings.ToUpper(strings.TrimSpace(record.Tracker)) != needle {
+			continue
+		}
+		filtered = append(filtered, record)
+	}
+	return filtered
+}
+
+func resolveTrackerScreenshots(urls []string) []api.ScreenshotImage {
+	if len(urls) == 0 {
+		return nil
+	}
+	hostCounts := make(map[string]int)
+	for _, rawURL := range urls {
+		trimmed := strings.TrimSpace(rawURL)
+		if trimmed == "" {
+			continue
+		}
+		if isTMDBImageURL(trimmed) {
+			continue
+		}
+		host := strings.ToLower(strings.TrimSpace(imagehost.ExtractHost(trimmed)))
+		if host == "" {
+			continue
+		}
+		hostCounts[host]++
+	}
+	selectedHost := pickMostCommonHost(hostCounts)
+	if selectedHost == "" {
+		return nil
+	}
+
+	results := make([]api.ScreenshotImage, 0, len(urls))
+	for _, rawURL := range urls {
+		trimmed := strings.TrimSpace(rawURL)
+		if trimmed == "" {
+			continue
+		}
+		if isTMDBImageURL(trimmed) {
+			continue
+		}
+		host := strings.TrimSpace(imagehost.ExtractHost(trimmed))
+		normalizedHost := strings.ToLower(host)
+		if selectedHost != "" && normalizedHost != selectedHost {
+			continue
+		}
+		results = append(results, api.ScreenshotImage{
+			Index:  freshScreenshotImageIndex(results),
+			Host:   host,
+			ImgURL: trimmed,
+			RawURL: trimmed,
+			WebURL: trimmed,
+		})
+	}
+	return results
+}
+
+func pickMostCommonHost(counts map[string]int) string {
+	best := ""
+	bestCount := 0
+	for host, count := range counts {
+		if count > bestCount || (count == bestCount && (best == "" || host < best)) {
+			best = host
+			bestCount = count
+		}
+	}
+	return best
+}
+
+func collectImageURLs(records []api.TrackerMetadata) []string {
+	if len(records) == 0 {
+		return nil
+	}
+	ordered := make([]api.TrackerMetadata, 0, len(records))
+	ordered = append(ordered, records...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		left := ordered[i]
+		right := ordered[j]
+		if !left.UpdatedAt.IsZero() || !right.UpdatedAt.IsZero() {
+			if left.UpdatedAt.After(right.UpdatedAt) {
+				return true
+			}
+			if left.UpdatedAt.Before(right.UpdatedAt) {
+				return false
+			}
+		}
+		return strings.ToUpper(left.Tracker) < strings.ToUpper(right.Tracker)
+	})
+	urls := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, record := range ordered {
+		for _, url := range record.ImageURLs {
+			trimmed := strings.TrimSpace(url)
+			if trimmed == "" {
+				continue
+			}
+			if isTMDBImageURL(trimmed) {
+				continue
+			}
+			if _, ok := seen[trimmed]; ok {
+				continue
+			}
+			seen[trimmed] = struct{}{}
+			urls = append(urls, trimmed)
+		}
+	}
+	return urls
+}
+
+func isTMDBImageURL(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	return strings.Contains(lower, "tmdb.org")
+}
+
+func combineDescriptions(records []api.TrackerMetadata) string {
+	if len(records) == 0 {
+		return ""
+	}
+	ordered := make([]api.TrackerMetadata, 0, len(records))
+	ordered = append(ordered, records...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		left := ordered[i]
+		right := ordered[j]
+		if !left.UpdatedAt.IsZero() || !right.UpdatedAt.IsZero() {
+			if left.UpdatedAt.After(right.UpdatedAt) {
+				return true
+			}
+			if left.UpdatedAt.Before(right.UpdatedAt) {
+				return false
+			}
+		}
+		return strings.ToUpper(left.Tracker) < strings.ToUpper(right.Tracker)
+	})
+	seen := make(map[string]struct{})
+	parts := make([]string, 0, len(ordered))
+	for _, record := range ordered {
+		trimmed := strings.TrimSpace(record.Description)
+		if trimmed == "" {
+			continue
+		}
+		key := strings.ToLower(trimmed)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		parts = append(parts, trimmed)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func stripEmbeddedNFOBlocks(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	cleaned := trimmed
+	for _, pattern := range embeddedNFOBlockPatterns {
+		cleaned = pattern.ReplaceAllString(cleaned, "")
+	}
+	cleaned = descriptionSpacingPattern.ReplaceAllString(cleaned, "\n\n")
+	return strings.TrimSpace(cleaned)
+}
+
+func sanitizeTrackerDescription(tracker string, value string) string {
+	cleaned := stripEmbeddedNFOBlocks(value)
+	switch strings.ToUpper(strings.TrimSpace(tracker)) {
+	case "ANT", "NBL":
+		cleaned = defaultSignaturePattern.ReplaceAllString(cleaned, "")
+		cleaned = descriptionSpacingPattern.ReplaceAllString(cleaned, "\n\n")
+		return strings.TrimSpace(cleaned)
+	default:
+		return cleaned
+	}
+}

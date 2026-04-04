@@ -1,0 +1,1703 @@
+// Copyright (c) 2025-2026, Audionut and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+package core
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/autobrr/upbrr/internal/config"
+	internalerrors "github.com/autobrr/upbrr/internal/errors"
+	"github.com/autobrr/upbrr/internal/services/db"
+	"github.com/autobrr/upbrr/pkg/api"
+)
+
+func TestRunUploadMultiplePaths(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubRepo{}
+	svc := api.ServiceSet{
+		Filesystem: &stubFS{},
+		Metadata:   &stubMeta{},
+		Torrents:   &stubTorrent{},
+		Clients:    &stubClient{},
+		Trackers:   &stubTrackers{},
+	}
+
+	core, err := New(api.CoreDependencies{
+		Config:     config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services:   svc,
+		Repository: repo,
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+	core.storeDupeCache("/tmp/a", "", api.PreparedMetadata{SourcePath: "/tmp/a"})
+	core.storeDupeCache("/tmp/b", "", api.PreparedMetadata{SourcePath: "/tmp/b"})
+
+	result, err := core.RunUpload(context.Background(), api.Request{
+		Paths: []string{"/tmp/a", "/tmp/b"},
+		Mode:  api.ModeCLI,
+	})
+	if err != nil {
+		t.Fatalf("run upload: %v", err)
+	}
+	if result.UploadedCount != 2 {
+		t.Fatalf("expected 2 uploads, got %d", result.UploadedCount)
+	}
+
+	if metaCalls := svc.Metadata.(*stubMeta).calls; metaCalls != 0 {
+		t.Fatalf("expected 0 metadata calls, got %d", metaCalls)
+	}
+	if trackerCalls := svc.Trackers.(*stubTrackers).calls; trackerCalls != 2 {
+		t.Fatalf("expected 2 tracker calls, got %d", trackerCalls)
+	}
+}
+
+func TestRunUploadPreparedDryRunSkipsUpload(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubRepo{}
+	tracker := &stubTrackers{}
+	client := &stubClient{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   &stubMeta{},
+			Torrents:   &stubTorrent{},
+			Clients:    client,
+			Trackers:   tracker,
+		},
+		Repository: repo,
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	core.storeDupeCache("/tmp/a", "", api.PreparedMetadata{SourcePath: "/tmp/a"})
+
+	result, err := core.RunUploadPrepared(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeGUI,
+		Options: api.UploadOptions{
+			DryRun: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("run upload prepared: %v", err)
+	}
+	if result.UploadedCount != 0 {
+		t.Fatalf("expected 0 uploads, got %d", result.UploadedCount)
+	}
+	if tracker.calls != 0 {
+		t.Fatalf("expected tracker not called, got %d", tracker.calls)
+	}
+	if client.calls != 0 {
+		t.Fatalf("expected client not called, got %d", client.calls)
+	}
+}
+
+func TestRunUploadPreparedSiteCheckForcesDryRun(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubRepo{}
+	tracker := &stubTrackers{}
+	client := &stubClient{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   &stubMeta{},
+			Torrents:   &stubTorrent{},
+			Clients:    client,
+			Trackers:   tracker,
+		},
+		Repository: repo,
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	core.storeDupeCache("/tmp/a", "", api.PreparedMetadata{SourcePath: "/tmp/a"})
+
+	result, err := core.RunUploadPrepared(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeGUI,
+		Execution: api.ExecutionOptions{
+			SiteCheck: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("run upload prepared: %v", err)
+	}
+	if result.UploadedCount != 0 {
+		t.Fatalf("expected 0 uploads, got %d", result.UploadedCount)
+	}
+	if tracker.calls != 0 {
+		t.Fatalf("expected tracker not called, got %d", tracker.calls)
+	}
+	if client.calls != 0 {
+		t.Fatalf("expected client not called, got %d", client.calls)
+	}
+}
+
+func TestRunUploadNoSeedSkipsClient(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubRepo{}
+	tracker := &stubTrackers{}
+	client := &stubClient{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   &stubMeta{},
+			Torrents:   &stubTorrent{},
+			Clients:    client,
+			Trackers:   tracker,
+		},
+		Repository: repo,
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+	core.storeDupeCache("/tmp/a", "", api.PreparedMetadata{SourcePath: "/tmp/a"})
+
+	result, err := core.RunUpload(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeCLI,
+		Options: api.UploadOptions{
+			NoSeed: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("run upload: %v", err)
+	}
+	if result.UploadedCount != 1 {
+		t.Fatalf("expected 1 upload, got %d", result.UploadedCount)
+	}
+	if tracker.calls != 1 {
+		t.Fatalf("expected tracker called once, got %d", tracker.calls)
+	}
+	if client.calls != 0 {
+		t.Fatalf("expected client not called, got %d", client.calls)
+	}
+}
+
+func TestRunUploadPreparedSiteUploadTrackerOverridesTrackers(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubRepo{}
+	tracker := &stubTrackers{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   &stubMeta{},
+			Torrents:   &stubTorrent{},
+			Clients:    &stubClient{},
+			Trackers:   tracker,
+		},
+		Repository: repo,
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+	core.storeDupeCache("/tmp/a", "", api.PreparedMetadata{SourcePath: "/tmp/a"})
+
+	_, err = core.RunUploadPrepared(context.Background(), api.Request{
+		Paths:    []string{"/tmp/a"},
+		Mode:     api.ModeGUI,
+		Trackers: []string{"AITHER"},
+		Execution: api.ExecutionOptions{
+			SiteUploadTracker: "BLU",
+		},
+	})
+	if err != nil {
+		t.Fatalf("run upload prepared: %v", err)
+	}
+	if len(tracker.lastMeta.Trackers) != 1 || tracker.lastMeta.Trackers[0] != "BLU" {
+		t.Fatalf("expected site upload tracker override, got %#v", tracker.lastMeta.Trackers)
+	}
+}
+
+func TestRunUploadDefaultsScreens(t *testing.T) {
+	t.Parallel()
+
+	meta := &stubMeta{}
+	tracker := &stubTrackers{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 5}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   meta,
+			Torrents:   &stubTorrent{},
+			Clients:    &stubClient{},
+			Trackers:   tracker,
+		},
+		Repository: &stubRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+	core.storeDupeCache("/tmp/a", "", api.PreparedMetadata{SourcePath: "/tmp/a"})
+
+	_, err = core.RunUpload(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeCLI,
+	})
+	if err != nil {
+		t.Fatalf("run upload: %v", err)
+	}
+	if tracker.lastMeta.Options.Screens != 5 {
+		t.Fatalf("expected screens default 5, got %d", tracker.lastMeta.Options.Screens)
+	}
+}
+
+func TestSaveFinalScreenshotSelectionsCLI(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubRepo{}
+	shots := &recordingScreenshots{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem:  &stubFS{},
+			Metadata:    &stubMeta{},
+			Screenshots: shots,
+		},
+		Repository: repo,
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	images := []api.ScreenshotImage{{Path: "/tmp/a.png"}, {Path: "/tmp/b.png"}}
+	if err := core.SaveFinalScreenshotSelections(context.Background(), api.Request{Paths: []string{"/tmp/a"}, Mode: api.ModeCLI}, images); err != nil {
+		t.Fatalf("save final selections: %v", err)
+	}
+	if shots.calls != 1 {
+		t.Fatalf("expected 1 call, got %d", shots.calls)
+	}
+	if len(shots.lastImages) != 2 {
+		t.Fatalf("expected 2 images, got %d", len(shots.lastImages))
+	}
+
+	if err := core.SaveFinalScreenshotSelections(context.Background(), api.Request{Paths: []string{"/tmp/a"}, Mode: api.ModeCLI}, nil); err != nil {
+		t.Fatalf("clear final selections: %v", err)
+	}
+	if shots.calls != 2 {
+		t.Fatalf("expected 2 calls, got %d", shots.calls)
+	}
+}
+
+func TestNewRejectsZeroScreens(t *testing.T) {
+	t.Parallel()
+
+	_, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 0}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   &stubMeta{},
+			Torrents:   &stubTorrent{},
+			Clients:    &stubClient{},
+			Trackers:   &stubTrackers{},
+		},
+		Repository: &stubRepo{},
+	})
+	if err == nil {
+		t.Fatalf("expected config validation error")
+	}
+	if !strings.Contains(err.Error(), "screenshot_handling.screens") {
+		t.Fatalf("expected screenshot validation error, got %v", err)
+	}
+}
+
+func TestRunUploadDedupesPaths(t *testing.T) {
+	t.Parallel()
+
+	meta := &stubMeta{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   meta,
+			Torrents:   &stubTorrent{},
+			Clients:    &stubClient{},
+			Trackers:   &stubTrackers{},
+		},
+		Repository: &stubRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+	core.storeDupeCache("/tmp/a", "", api.PreparedMetadata{SourcePath: "/tmp/a"})
+
+	_, err = core.RunUpload(context.Background(), api.Request{
+		Paths: []string{"/tmp/a", "/tmp/a"},
+		Mode:  api.ModeCLI,
+	})
+	if err != nil {
+		t.Fatalf("run upload: %v", err)
+	}
+	if meta.calls != 0 {
+		t.Fatalf("expected 0 metadata calls, got %d", meta.calls)
+	}
+}
+
+func TestRunUploadSkipsPathedSearchWithStoredTrackerData(t *testing.T) {
+	t.Parallel()
+
+	client := &stubClient{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   &stubMeta{},
+			Torrents:   &stubTorrent{},
+			Clients:    client,
+			Trackers:   &stubTrackers{},
+		},
+		Repository: trackerRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+	core.storeDupeCache("/tmp/a", "", api.PreparedMetadata{SourcePath: "/tmp/a"})
+
+	_, err = core.RunUpload(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeCLI,
+	})
+	if err != nil {
+		t.Fatalf("run upload: %v", err)
+	}
+	if client.searchCalls != 0 {
+		t.Fatalf("expected pathed search skipped, got %d calls", client.searchCalls)
+	}
+}
+
+func TestRunUploadSkipsPathedSearchWithStoredInfoHash(t *testing.T) {
+	t.Parallel()
+
+	client := &stubClient{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata: &stubMeta{prepared: api.PreparedMetadata{
+				StoredDataFresh: true,
+				StoredInfoHash:  "hash123",
+			}},
+			Torrents: &stubTorrent{},
+			Clients:  client,
+			Trackers: &stubTrackers{},
+		},
+		Repository: &stubRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+	core.storeDupeCache("/tmp/a", "", api.PreparedMetadata{SourcePath: "/tmp/a"})
+
+	_, err = core.RunUpload(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeCLI,
+	})
+	if err != nil {
+		t.Fatalf("run upload: %v", err)
+	}
+	if client.searchCalls != 0 {
+		t.Fatalf("expected pathed search skipped, got %d calls", client.searchCalls)
+	}
+}
+
+func TestRunUploadSkipsPathedSearchWithFreshStoredSnapshot(t *testing.T) {
+	t.Parallel()
+
+	client := &stubClient{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata: &stubMeta{prepared: api.PreparedMetadata{
+				StoredDataFresh: true,
+			}},
+			Torrents: &stubTorrent{},
+			Clients:  client,
+			Trackers: &stubTrackers{},
+		},
+		Repository: &stubRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+	core.storeDupeCache("/tmp/a", "", api.PreparedMetadata{SourcePath: "/tmp/a"})
+
+	_, err = core.RunUpload(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeCLI,
+	})
+	if err != nil {
+		t.Fatalf("run upload: %v", err)
+	}
+	if client.searchCalls != 0 {
+		t.Fatalf("expected pathed search skipped, got %d calls", client.searchCalls)
+	}
+}
+
+func TestFetchMetadataPreviewRunsPathedSearchWithStoredTrackerData(t *testing.T) {
+	t.Parallel()
+
+	client := &stubClient{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   &stubMeta{},
+			Clients:    client,
+		},
+		Repository: trackerRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	_, err = core.FetchMetadataPreview(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeGUI,
+	})
+	if err != nil {
+		t.Fatalf("fetch metadata preview: %v", err)
+	}
+	if client.searchCalls != 1 {
+		t.Fatalf("expected pathed search to run once for tracker presence, got %d calls", client.searchCalls)
+	}
+}
+
+func TestFetchMetadataPreviewSkipAutoTorrentSkipsPathedSearch(t *testing.T) {
+	t.Parallel()
+
+	client := &stubClient{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   &stubMeta{},
+			Clients:    client,
+		},
+		Repository: &stubRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	_, err = core.FetchMetadataPreview(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeGUI,
+		Options: api.UploadOptions{
+			SkipAutoTorrent: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("fetch metadata preview: %v", err)
+	}
+	if client.searchCalls != 0 {
+		t.Fatalf("expected pathed search skipped, got %d calls", client.searchCalls)
+	}
+}
+
+func TestFetchMetadataPreviewRunsPathedSearchWithFreshStoredSnapshot(t *testing.T) {
+	t.Parallel()
+
+	client := &stubClient{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata: &stubMeta{prepared: api.PreparedMetadata{
+				StoredDataFresh: true,
+			}},
+			Clients: client,
+		},
+		Repository: &stubRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	_, err = core.FetchMetadataPreview(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeGUI,
+	})
+	if err != nil {
+		t.Fatalf("fetch metadata preview: %v", err)
+	}
+	if client.searchCalls != 1 {
+		t.Fatalf("expected pathed search to run once for tracker presence, got %d calls", client.searchCalls)
+	}
+}
+
+func TestCheckDupesRunsPathedSearchWithSourceURLOverride(t *testing.T) {
+	t.Parallel()
+
+	client := &stubClient{searchResult: api.ClientSearchResult{MatchedTrackers: []string{"BLU"}, FoundTrackerMatch: true}}
+	dupes := &stubDupes{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata: &stubMeta{prepared: api.PreparedMetadata{
+				SourceLookupActive: true,
+				SourceLookupMode:   "media",
+			}},
+			Clients: client,
+			Dupes:   dupes,
+		},
+		Repository: &stubRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	_, err = core.CheckDupes(context.Background(), api.Request{
+		Paths:    []string{"/tmp/a"},
+		Mode:     api.ModeCLI,
+		Trackers: []string{"BLU", "HDB"},
+	})
+	if err != nil {
+		t.Fatalf("check duplicates: %v", err)
+	}
+	if client.searchCalls != 1 {
+		t.Fatalf("expected pathed search to run once, got %d calls", client.searchCalls)
+	}
+	for _, tracker := range dupes.lastTrackers {
+		if tracker == "BLU" {
+			t.Fatalf("expected BLU to be removed from dupe check trackers, got %v", dupes.lastTrackers)
+		}
+	}
+}
+
+func TestCheckDupesSkipAutoTorrentSkipsPathedSearch(t *testing.T) {
+	t.Parallel()
+
+	client := &stubClient{}
+	dupes := &stubDupes{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   &stubMeta{},
+			Clients:    client,
+			Dupes:      dupes,
+		},
+		Repository: &stubRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	_, err = core.CheckDupes(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeCLI,
+		Options: api.UploadOptions{
+			SkipAutoTorrent: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("check duplicates: %v", err)
+	}
+	if client.searchCalls != 0 {
+		t.Fatalf("expected pathed search skipped, got %d calls", client.searchCalls)
+	}
+}
+
+func TestAppendPathedDupeResultsCombinesTrackers(t *testing.T) {
+	t.Parallel()
+
+	summary := api.DupeCheckSummary{
+		Results: []api.DupeCheckResult{
+			{Tracker: "ANT", Status: "completed"},
+			{
+				Tracker: "BLU",
+				Status:  "completed",
+				Notes:   []string{"pathed torrent match found; skipping dupe search"},
+			},
+		},
+	}
+
+	updated := appendPathedDupeResults(summary, []string{"AITHER", "BLU", "ANTHELION"})
+
+	if len(updated.Results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(updated.Results))
+	}
+	if updated.Results[0].Tracker != "ANT" {
+		t.Fatalf("expected non-pathed result preserved, got %q", updated.Results[0].Tracker)
+	}
+
+	combined := updated.Results[1]
+	if combined.Tracker != "AITHER, ANTHELION, BLU" {
+		t.Fatalf("expected combined trackers, got %q", combined.Tracker)
+	}
+	if !combined.HasDupes {
+		t.Fatalf("expected combined result to be marked as dupe")
+	}
+	if combined.Status != "completed" {
+		t.Fatalf("expected combined status completed, got %q", combined.Status)
+	}
+	if len(combined.Notes) != 1 || combined.Notes[0] != "pathed torrent match found; skipping dupe search" {
+		t.Fatalf("expected pathed note preserved, got %v", combined.Notes)
+	}
+}
+
+func TestFetchMetadataPreviewRunsPathedSearchWithSourceURLOverride(t *testing.T) {
+	t.Parallel()
+
+	client := &stubClient{searchResult: api.ClientSearchResult{
+		MatchedTrackers:   []string{"BLU"},
+		FoundTrackerMatch: true,
+		TrackerIDs: map[string]string{
+			"blu": "999",
+		},
+	}}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata: &stubMeta{prepared: api.PreparedMetadata{
+				SourceLookupActive:    true,
+				SourceLookupMode:      "tracker",
+				SourceLookupTracker:   "AITHER",
+				SourceLookupTrackerID: "111",
+				TrackerIDs:            map[string]string{"aither": "111"},
+				MatchedTrackers:       []string{"AITHER"},
+				TrackerData: []api.TrackerMetadata{{
+					Tracker: "AITHER",
+					TMDBID:  100,
+				}},
+			}},
+			Clients: client,
+		},
+		Repository: &stubRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	_, err = core.FetchMetadataPreview(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeGUI,
+	})
+	if err != nil {
+		t.Fatalf("fetch metadata preview: %v", err)
+	}
+	if client.searchCalls != 1 {
+		t.Fatalf("expected pathed search to run once, got %d calls", client.searchCalls)
+	}
+
+	cached, ok := core.getDupeCache("/tmp/a", "")
+	if !ok {
+		t.Fatalf("expected metadata cache entry")
+	}
+	if got := cached.TrackerIDs["aither"]; got != "111" {
+		t.Fatalf("expected source lookup tracker id preserved, got %q", got)
+	}
+	foundBLU := false
+	for _, tracker := range cached.MatchedTrackers {
+		if tracker == "BLU" {
+			foundBLU = true
+			break
+		}
+	}
+	if !foundBLU {
+		t.Fatalf("expected BLU to be tracked as existing in client, got %v", cached.MatchedTrackers)
+	}
+}
+
+func TestRunUploadPersistsInfoHash(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingRepo{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   &stubMeta{},
+			Torrents:   &stubTorrentWithHash{hash: "hash123"},
+			Clients:    &stubClient{},
+			Trackers:   &stubTrackers{},
+		},
+		Repository: repo,
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+	core.storeDupeCache("/tmp/a", "", api.PreparedMetadata{SourcePath: "/tmp/a"})
+
+	_, err = core.RunUpload(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeCLI,
+	})
+	if err != nil {
+		t.Fatalf("run upload: %v", err)
+	}
+	if len(repo.saved) != 1 {
+		t.Fatalf("expected 1 metadata save, got %d", len(repo.saved))
+	}
+	if repo.saved[0].InfoHash != "hash123" {
+		t.Fatalf("expected info hash saved, got %q", repo.saved[0].InfoHash)
+	}
+}
+
+func TestFetchMetadataPreviewPurgesContentForExternalOverrides(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingRepo{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   &stubMeta{},
+			Clients:    &stubClient{},
+		},
+		Repository: repo,
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	tmdbID := 123
+	_, err = core.FetchMetadataPreview(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeGUI,
+		ExternalIDOverrides: api.ExternalIDOverrides{
+			TMDBID: &tmdbID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("fetch metadata preview: %v", err)
+	}
+	if repo.purgeCalls != 1 {
+		t.Fatalf("expected 1 purge call, got %d", repo.purgeCalls)
+	}
+	if len(repo.purgedPaths) != 1 || repo.purgedPaths[0] != "/tmp/a" {
+		t.Fatalf("unexpected purged paths: %v", repo.purgedPaths)
+	}
+}
+
+func TestFetchMetadataPreviewWithoutExternalOverridesDoesNotPurge(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingRepo{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   &stubMeta{},
+			Clients:    &stubClient{},
+		},
+		Repository: repo,
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	_, err = core.FetchMetadataPreview(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeGUI,
+	})
+	if err != nil {
+		t.Fatalf("fetch metadata preview: %v", err)
+	}
+	if repo.purgeCalls != 0 {
+		t.Fatalf("expected no purge calls, got %d", repo.purgeCalls)
+	}
+}
+
+func TestRunUploadPreparedUsesCachedMetadata(t *testing.T) {
+	t.Parallel()
+
+	meta := &stubMeta{}
+	tracker := &stubTrackers{}
+	client := &stubClient{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   meta,
+			Torrents:   &stubTorrent{},
+			Clients:    client,
+			Trackers:   tracker,
+		},
+		Repository: &stubRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	prepared := api.PreparedMetadata{SourcePath: "/tmp/a", Trackers: []string{"AITHER"}}
+	core.storeDupeCache("/tmp/a", "", prepared)
+
+	result, err := core.RunUploadPrepared(context.Background(), api.Request{
+		Paths:    []string{"/tmp/a"},
+		Mode:     api.ModeGUI,
+		Trackers: []string{"HDB"},
+	})
+	if err != nil {
+		t.Fatalf("run upload prepared: %v", err)
+	}
+	if result.UploadedCount != 1 {
+		t.Fatalf("expected 1 upload, got %d", result.UploadedCount)
+	}
+	if meta.calls != 0 {
+		t.Fatalf("expected no metadata prepare calls, got %d", meta.calls)
+	}
+	if tracker.calls != 1 {
+		t.Fatalf("expected tracker called once, got %d", tracker.calls)
+	}
+	if client.calls != 1 {
+		t.Fatalf("expected client inject called once, got %d", client.calls)
+	}
+	if len(tracker.lastMeta.Trackers) != 1 || tracker.lastMeta.Trackers[0] != "HDB" {
+		t.Fatalf("expected request tracker override applied, got %v", tracker.lastMeta.Trackers)
+	}
+}
+
+func TestRunUploadPreparedInjectsEachUploadedTrackerURL(t *testing.T) {
+	t.Parallel()
+
+	meta := &stubMeta{}
+	tracker := &stubTrackers{
+		summary: api.UploadSummary{
+			Uploaded: 2,
+			UploadedTorrents: []api.UploadedTorrent{
+				{Tracker: "AITHER", DownloadURL: "https://aither.cc/torrent/download/111"},
+				{Tracker: "BLU", DownloadURL: "https://blutopia.cc/torrent/download/222"},
+			},
+		},
+	}
+	client := &stubClient{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   meta,
+			Torrents:   &stubTorrent{},
+			Clients:    client,
+			Trackers:   tracker,
+		},
+		Repository: &stubRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	prepared := api.PreparedMetadata{SourcePath: "/tmp/a", Trackers: []string{"AITHER", "BLU"}}
+	core.storeDupeCache("/tmp/a", "", prepared)
+
+	result, err := core.RunUploadPrepared(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeGUI,
+	})
+	if err != nil {
+		t.Fatalf("run upload prepared: %v", err)
+	}
+	if result.UploadedCount != 2 {
+		t.Fatalf("expected 2 uploads, got %d", result.UploadedCount)
+	}
+	if client.calls != 2 {
+		t.Fatalf("expected client inject called twice, got %d", client.calls)
+	}
+}
+
+func TestRunUploadPreparedForwardsTrackerTorrentPath(t *testing.T) {
+	t.Parallel()
+
+	meta := &stubMeta{}
+	tracker := &stubTrackers{
+		summary: api.UploadSummary{
+			Uploaded: 1,
+			UploadedTorrents: []api.UploadedTorrent{{
+				Tracker:     "HDB",
+				DownloadURL: "https://hdbits.org/download.php/file?id=333&passkey=abc",
+				TorrentPath: "/tmp/release.hdb.torrent",
+			}},
+		},
+	}
+	client := &stubClient{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   meta,
+			Torrents:   &stubTorrent{},
+			Clients:    client,
+			Trackers:   tracker,
+		},
+		Repository: &stubRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	prepared := api.PreparedMetadata{SourcePath: "/tmp/a", Trackers: []string{"HDB"}}
+	core.storeDupeCache("/tmp/a", "", prepared)
+
+	result, err := core.RunUploadPrepared(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeGUI,
+	})
+	if err != nil {
+		t.Fatalf("run upload prepared: %v", err)
+	}
+	if result.UploadedCount != 1 {
+		t.Fatalf("expected 1 upload, got %d", result.UploadedCount)
+	}
+	if len(client.injected) != 1 {
+		t.Fatalf("expected one injection payload, got %d", len(client.injected))
+	}
+	if client.injected[0].Path != "/tmp/release.hdb.torrent" {
+		t.Fatalf("expected torrent path to be forwarded, got %q", client.injected[0].Path)
+	}
+	if client.injected[0].URL != "https://hdbits.org/download.php/file?id=333&passkey=abc" {
+		t.Fatalf("expected download URL to be forwarded, got %q", client.injected[0].URL)
+	}
+}
+
+func TestRunUploadPreparedRequiresCachedMetadata(t *testing.T) {
+	t.Parallel()
+
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   &stubMeta{},
+			Torrents:   &stubTorrent{},
+			Clients:    &stubClient{},
+			Trackers:   &stubTrackers{},
+		},
+		Repository: &stubRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	_, err = core.RunUploadPrepared(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeGUI,
+	})
+	if err == nil {
+		t.Fatalf("expected upload-only cache error")
+	}
+	if !strings.Contains(err.Error(), "requires prepared metadata") {
+		t.Fatalf("expected prepared metadata error, got %v", err)
+	}
+}
+
+func TestFetchTrackerDryRunPreviewUsesCachedMetadata(t *testing.T) {
+	t.Parallel()
+
+	meta := &stubMeta{}
+	tracker := &stubTrackers{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   meta,
+			Torrents:   &stubTorrent{},
+			Clients:    &stubClient{},
+			Trackers:   tracker,
+		},
+		Repository: &stubRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	prepared := api.PreparedMetadata{SourcePath: "/tmp/a", ReleaseName: "Watcher 2160p WEB-DL DD+ 5.1-FLUX"}
+	core.storeDupeCache("/tmp/a", "", prepared)
+
+	preview, err := core.FetchTrackerDryRunPreview(context.Background(), api.Request{
+		Paths:    []string{"/tmp/a"},
+		Mode:     api.ModeGUI,
+		Trackers: []string{"AITHER"},
+	})
+	if err != nil {
+		t.Fatalf("fetch tracker dry-run preview: %v", err)
+	}
+	if preview.SourcePath != "/tmp/a" {
+		t.Fatalf("expected source path /tmp/a, got %q", preview.SourcePath)
+	}
+	if meta.calls != 0 {
+		t.Fatalf("expected no metadata prepare calls, got %d", meta.calls)
+	}
+	if tracker.dryRunCalls != 1 {
+		t.Fatalf("expected 1 dry-run build call, got %d", tracker.dryRunCalls)
+	}
+}
+
+func TestFetchTrackerDryRunPreviewPassesRuleFailureOverride(t *testing.T) {
+	t.Parallel()
+
+	tracker := &stubTrackers{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   &stubMeta{},
+			Torrents:   &stubTorrent{},
+			Clients:    &stubClient{},
+			Trackers:   tracker,
+		},
+		Repository: &stubRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	core.storeDupeCache("/tmp/a", "", api.PreparedMetadata{SourcePath: "/tmp/a"})
+
+	_, err = core.FetchTrackerDryRunPreview(context.Background(), api.Request{
+		Paths:                     []string{"/tmp/a"},
+		Mode:                      api.ModeGUI,
+		Trackers:                  []string{"AITHER"},
+		IgnoreTrackerRuleFailures: true,
+	})
+	if err != nil {
+		t.Fatalf("fetch tracker dry-run preview: %v", err)
+	}
+	if !tracker.lastMeta.IgnoreTrackerRuleFailures {
+		t.Fatalf("expected ignore tracker rule failures flag to be passed to dry-run")
+	}
+}
+
+func TestFetchTrackerDryRunPreviewRequiresCachedMetadata(t *testing.T) {
+	t.Parallel()
+
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   &stubMeta{},
+			Torrents:   &stubTorrent{},
+			Clients:    &stubClient{},
+			Trackers:   &stubTrackers{},
+		},
+		Repository: &stubRepo{},
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	_, err = core.FetchTrackerDryRunPreview(context.Background(), api.Request{
+		Paths: []string{"/tmp/a"},
+		Mode:  api.ModeGUI,
+	})
+	if err == nil {
+		t.Fatalf("expected tracker dry-run cache error")
+	}
+	if !strings.Contains(err.Error(), "requires prepared metadata") {
+		t.Fatalf("expected prepared metadata error, got %v", err)
+	}
+}
+
+func TestRunUploadPreparedPassesRuleFailureOverride(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubRepo{}
+	tracker := &stubTrackers{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   &stubMeta{},
+			Torrents:   &stubTorrent{},
+			Clients:    &stubClient{},
+			Trackers:   tracker,
+		},
+		Repository: repo,
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+
+	core.storeDupeCache("/tmp/a", "", api.PreparedMetadata{SourcePath: "/tmp/a"})
+
+	_, err = core.RunUploadPrepared(context.Background(), api.Request{
+		Paths:                     []string{"/tmp/a"},
+		Mode:                      api.ModeGUI,
+		Trackers:                  []string{"AITHER"},
+		IgnoreTrackerRuleFailures: true,
+	})
+	if err != nil {
+		t.Fatalf("run upload prepared: %v", err)
+	}
+	if !tracker.lastMeta.IgnoreTrackerRuleFailures {
+		t.Fatalf("expected ignore tracker rule failures flag to be passed to upload")
+	}
+}
+
+func TestRunUploadPreparedFiltersRuleFailuresPerTracker(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubRepo{}
+	tracker := &stubTrackers{}
+	core, err := New(api.CoreDependencies{
+		Config: config.Config{MainSettings: config.MainSettingsConfig{TMDBAPI: "x"}, ScreenshotHandling: config.ScreenshotHandlingConfig{Screens: 1}},
+		Services: api.ServiceSet{
+			Filesystem: &stubFS{},
+			Metadata:   &stubMeta{},
+			Torrents:   &stubTorrent{},
+			Clients:    &stubClient{},
+			Trackers:   tracker,
+		},
+		Repository: repo,
+	})
+	if err != nil {
+		t.Fatalf("new core: %v", err)
+	}
+	core.storeDupeCache("/tmp/a", "", api.PreparedMetadata{
+		SourcePath: "/tmp/a",
+		TrackerRuleFailures: map[string][]api.RuleFailure{
+			"AITHER": {{Rule: "rule_a", Reason: "a"}},
+			"BLU":    {{Rule: "rule_b", Reason: "b"}},
+		},
+	})
+
+	_, err = core.RunUploadPrepared(context.Background(), api.Request{
+		Paths:                        []string{"/tmp/a"},
+		Mode:                         api.ModeCLI,
+		Trackers:                     []string{"AITHER", "BLU"},
+		IgnoreTrackerRuleFailuresFor: []string{"AITHER"},
+	})
+	if err != nil {
+		t.Fatalf("run upload prepared: %v", err)
+	}
+	if _, ok := tracker.lastMeta.TrackerRuleFailures["AITHER"]; ok {
+		t.Fatalf("expected AITHER rule failure removed from prepared meta")
+	}
+	if _, ok := tracker.lastMeta.TrackerRuleFailures["BLU"]; !ok {
+		t.Fatalf("expected BLU rule failure preserved")
+	}
+}
+
+type stubRepo struct{}
+
+func (stubRepo) GetByPath(context.Context, string) (db.FileMetadata, error) {
+	return db.FileMetadata{}, internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) Save(context.Context, db.FileMetadata) error {
+	return nil
+}
+
+func (stubRepo) GetExternalIDs(context.Context, string) (db.ExternalIDs, error) {
+	return db.ExternalIDs{}, internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) SaveExternalIDs(context.Context, db.ExternalIDs) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) GetExternalMetadata(context.Context, string) (db.ExternalMetadata, error) {
+	return db.ExternalMetadata{}, internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) SaveExternalMetadata(context.Context, db.ExternalMetadata) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) GetDVDMediaInfo(context.Context, string) (db.DVDMediaInfo, error) {
+	return db.DVDMediaInfo{}, internalerrors.ErrNotFound
+}
+
+func (stubRepo) SaveDVDMediaInfo(context.Context, db.DVDMediaInfo) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) GetReleaseNameOverrides(context.Context, string) (db.ReleaseNameOverrides, error) {
+	return db.ReleaseNameOverrides{}, internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) SaveReleaseNameOverrides(context.Context, string, db.ReleaseNameOverrides) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) DeleteReleaseNameOverrides(context.Context, string) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) GetDescriptionOverride(context.Context, string) (db.DescriptionOverride, error) {
+	return db.DescriptionOverride{}, internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) SaveDescriptionOverride(context.Context, db.DescriptionOverride) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) DeleteDescriptionOverride(context.Context, string) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) ListHistoryEntries(context.Context) ([]db.HistoryEntry, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) ListUploadHistoryByPath(context.Context, string) ([]db.UploadRecord, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) ListPendingUploads(context.Context) ([]db.UploadRecord, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) CreateUploadRecord(context.Context, db.UploadRecord) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) UpdateLatestUploadRecordStatus(context.Context, string, string, string) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) SaveTrackerRuleFailures(context.Context, string, string, []db.TrackerRuleFailure) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) ListTrackerRuleFailuresByPath(context.Context, string) ([]db.TrackerRuleFailure, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) GetTrackerTimestamp(context.Context, string) (time.Time, error) {
+	return time.Time{}, internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) SaveTrackerTimestamp(context.Context, db.TrackerTimestamp) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) SaveTrackerMetadata(context.Context, db.TrackerMetadata) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) ListTrackerMetadataByPath(context.Context, string) ([]db.TrackerMetadata, error) {
+	return nil, nil
+}
+
+func (stubRepo) SaveScreenshot(context.Context, db.Screenshot) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) ListScreenshotsByPath(context.Context, string) ([]db.Screenshot, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) DeleteScreenshot(context.Context, string) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) SaveFinalSelections(context.Context, string, []db.ScreenshotFinalSelection) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) ListFinalSelections(context.Context, string) ([]db.ScreenshotFinalSelection, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) DeleteFinalSelection(context.Context, string) error {
+	return internalerrors.ErrNotImplemented
+}
+func (stubRepo) ReplaceScreenshotSlots(context.Context, string, []db.ScreenshotSlot) error {
+	return internalerrors.ErrNotImplemented
+}
+func (stubRepo) ListScreenshotSlotsByPath(context.Context, string) ([]db.ScreenshotSlot, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+func (stubRepo) UpsertScreenshotSlotVariants(context.Context, string, []db.ScreenshotSlotVariant) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) SaveUploadedImages(context.Context, string, string, []db.UploadedImageLink) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) ListUploadedImagesByPath(context.Context, string) ([]db.UploadedImageLink, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) DeleteUploadedImage(context.Context, string, string, string) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) GetPlaylistSelection(context.Context, string) (db.PlaylistSelection, error) {
+	return db.PlaylistSelection{}, internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) SavePlaylistSelection(context.Context, string, []string, bool) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) DeletePlaylistSelection(context.Context, string) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) ListStoredReleasePaths(context.Context) ([]string, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+
+func (stubRepo) PurgeContentData(context.Context, string) error {
+	return internalerrors.ErrNotImplemented
+}
+
+type trackerRepo struct{ stubRepo }
+
+func (trackerRepo) ListTrackerMetadataByPath(context.Context, string) ([]db.TrackerMetadata, error) {
+	return []db.TrackerMetadata{{
+		SourcePath: "/tmp/a",
+		Tracker:    "BLU",
+		TrackerID:  "123",
+		InfoHash:   "hash123",
+		Matched:    true,
+	}}, nil
+}
+
+type recordingRepo struct {
+	saved       []db.FileMetadata
+	purgeCalls  int
+	purgedPaths []string
+}
+
+func (r *recordingRepo) GetByPath(context.Context, string) (db.FileMetadata, error) {
+	return db.FileMetadata{}, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) Save(_ context.Context, metadata db.FileMetadata) error {
+	r.saved = append(r.saved, metadata)
+	return nil
+}
+
+func (r *recordingRepo) GetExternalIDs(context.Context, string) (db.ExternalIDs, error) {
+	return db.ExternalIDs{}, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) SaveExternalIDs(context.Context, db.ExternalIDs) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) GetExternalMetadata(context.Context, string) (db.ExternalMetadata, error) {
+	return db.ExternalMetadata{}, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) SaveExternalMetadata(context.Context, db.ExternalMetadata) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) GetDVDMediaInfo(context.Context, string) (db.DVDMediaInfo, error) {
+	return db.DVDMediaInfo{}, internalerrors.ErrNotFound
+}
+
+func (r *recordingRepo) SaveDVDMediaInfo(context.Context, db.DVDMediaInfo) error {
+	return nil
+}
+
+func (r *recordingRepo) GetReleaseNameOverrides(context.Context, string) (db.ReleaseNameOverrides, error) {
+	return db.ReleaseNameOverrides{}, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) SaveReleaseNameOverrides(context.Context, string, db.ReleaseNameOverrides) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) DeleteReleaseNameOverrides(context.Context, string) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) GetDescriptionOverride(context.Context, string) (db.DescriptionOverride, error) {
+	return db.DescriptionOverride{}, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) SaveDescriptionOverride(context.Context, db.DescriptionOverride) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) DeleteDescriptionOverride(context.Context, string) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) ListHistoryEntries(context.Context) ([]db.HistoryEntry, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) ListUploadHistoryByPath(context.Context, string) ([]db.UploadRecord, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) ListPendingUploads(context.Context) ([]db.UploadRecord, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) CreateUploadRecord(context.Context, db.UploadRecord) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) UpdateLatestUploadRecordStatus(context.Context, string, string, string) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) SaveTrackerRuleFailures(context.Context, string, string, []db.TrackerRuleFailure) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) ListTrackerRuleFailuresByPath(context.Context, string) ([]db.TrackerRuleFailure, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) GetTrackerTimestamp(context.Context, string) (time.Time, error) {
+	return time.Time{}, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) SaveTrackerTimestamp(context.Context, db.TrackerTimestamp) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) SaveTrackerMetadata(context.Context, db.TrackerMetadata) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) ListTrackerMetadataByPath(context.Context, string) ([]db.TrackerMetadata, error) {
+	return nil, nil
+}
+
+func (r *recordingRepo) SaveScreenshot(context.Context, db.Screenshot) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) ListScreenshotsByPath(context.Context, string) ([]db.Screenshot, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) DeleteScreenshot(context.Context, string) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) SaveFinalSelections(context.Context, string, []db.ScreenshotFinalSelection) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) ListFinalSelections(context.Context, string) ([]db.ScreenshotFinalSelection, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) DeleteFinalSelection(context.Context, string) error {
+	return internalerrors.ErrNotImplemented
+}
+func (r *recordingRepo) ReplaceScreenshotSlots(context.Context, string, []db.ScreenshotSlot) error {
+	return internalerrors.ErrNotImplemented
+}
+func (r *recordingRepo) ListScreenshotSlotsByPath(context.Context, string) ([]db.ScreenshotSlot, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+func (r *recordingRepo) UpsertScreenshotSlotVariants(context.Context, string, []db.ScreenshotSlotVariant) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) SaveUploadedImages(context.Context, string, string, []db.UploadedImageLink) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) ListUploadedImagesByPath(context.Context, string) ([]db.UploadedImageLink, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) DeleteUploadedImage(context.Context, string, string, string) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) GetPlaylistSelection(context.Context, string) (db.PlaylistSelection, error) {
+	return db.PlaylistSelection{}, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) SavePlaylistSelection(context.Context, string, []string, bool) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) DeletePlaylistSelection(context.Context, string) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) ListStoredReleasePaths(context.Context) ([]string, error) {
+	return nil, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingRepo) PurgeContentData(_ context.Context, path string) error {
+	r.purgeCalls++
+	r.purgedPaths = append(r.purgedPaths, path)
+	return nil
+}
+
+type stubFS struct{}
+
+func (stubFS) ValidatePaths(_ context.Context, paths []string) ([]string, error) {
+	return paths, nil
+}
+
+type stubMeta struct {
+	calls    int
+	options  api.UploadOptions
+	prepared api.PreparedMetadata
+}
+
+func (s *stubMeta) Prepare(ctx context.Context, req api.Request) (api.PreparedMetadata, error) {
+	s.calls++
+	s.options = req.Options
+	meta := api.PreparedMetadata{SourcePath: req.Paths[0], Paths: req.Paths, Mode: req.Mode, Options: req.Options}
+	if s.prepared.SourcePath == "" {
+		s.prepared.SourcePath = req.Paths[0]
+	}
+	if len(s.prepared.Paths) == 0 {
+		s.prepared.Paths = req.Paths
+	}
+	if s.prepared.Mode == "" {
+		s.prepared.Mode = req.Mode
+	}
+	if s.prepared.Options == (api.UploadOptions{}) {
+		s.prepared.Options = req.Options
+	}
+	if s.prepared.SourcePath != "" {
+		meta = s.prepared
+	}
+	return meta, nil
+}
+
+func (s *stubMeta) EnrichTrackerData(ctx context.Context, meta api.PreparedMetadata) (api.PreparedMetadata, error) {
+	return meta, nil
+}
+
+func (s *stubMeta) ApplyMediaInfoIDs(ctx context.Context, meta api.PreparedMetadata) (api.PreparedMetadata, error) {
+	return meta, nil
+}
+
+func (s *stubMeta) ApplyArrData(ctx context.Context, meta api.PreparedMetadata) (api.PreparedMetadata, error) {
+	return meta, nil
+}
+
+func (s *stubMeta) ResolveExternalIDs(ctx context.Context, meta api.PreparedMetadata) (api.PreparedMetadata, error) {
+	return meta, nil
+}
+
+func (s *stubMeta) ApplyMediaDetails(ctx context.Context, meta api.PreparedMetadata) (api.PreparedMetadata, error) {
+	return meta, nil
+}
+
+type recordingScreenshots struct {
+	calls      int
+	lastMeta   api.PreparedMetadata
+	lastImages []api.ScreenshotImage
+}
+
+func (r *recordingScreenshots) Plan(context.Context, api.PreparedMetadata, int) (api.ScreenshotPlan, error) {
+	return api.ScreenshotPlan{}, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingScreenshots) Capture(context.Context, api.PreparedMetadata, []api.ScreenshotSelection, api.ScreenshotPurpose) (api.ScreenshotResult, error) {
+	return api.ScreenshotResult{}, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingScreenshots) PreviewFrame(context.Context, api.PreparedMetadata, float64) (api.ScreenshotPreview, error) {
+	return api.ScreenshotPreview{}, internalerrors.ErrNotImplemented
+}
+
+func (r *recordingScreenshots) Delete(context.Context, api.PreparedMetadata, string) error {
+	return internalerrors.ErrNotImplemented
+}
+
+func (r *recordingScreenshots) SaveFinalSelections(_ context.Context, meta api.PreparedMetadata, images []api.ScreenshotImage) error {
+	r.calls++
+	r.lastMeta = meta
+	r.lastImages = images
+	return nil
+}
+
+type stubTorrent struct{}
+
+func (stubTorrent) Create(context.Context, api.PreparedMetadata) (api.TorrentResult, error) {
+	return api.TorrentResult{Path: "/tmp/file.torrent"}, nil
+}
+
+type stubTorrentWithHash struct {
+	hash string
+}
+
+func (s *stubTorrentWithHash) Create(context.Context, api.PreparedMetadata) (api.TorrentResult, error) {
+	return api.TorrentResult{Path: "/tmp/file.torrent", InfoHash: s.hash}, nil
+}
+
+type stubClient struct {
+	calls        int
+	searchCalls  int
+	searchResult api.ClientSearchResult
+	searchErr    error
+	injected     []api.TorrentResult
+}
+
+func (s *stubClient) Inject(_ context.Context, _ api.PreparedMetadata, torrent api.TorrentResult) error {
+	s.calls++
+	s.injected = append(s.injected, torrent)
+	return nil
+}
+
+func (s *stubClient) SearchPathedTorrents(context.Context, api.PreparedMetadata) (api.ClientSearchResult, error) {
+	s.searchCalls++
+	if s.searchErr != nil {
+		return api.ClientSearchResult{}, s.searchErr
+	}
+	return s.searchResult, nil
+}
+
+type stubDupes struct {
+	lastTrackers []string
+}
+
+func (s *stubDupes) Check(ctx context.Context, _ api.PreparedMetadata, trackers []string) (api.DupeCheckSummary, error) {
+	s.lastTrackers = append([]string{}, trackers...)
+	return api.DupeCheckSummary{}, nil
+}
+
+type stubTrackers struct {
+	calls       int
+	dryRunCalls int
+	lastMeta    api.PreparedMetadata
+	summary     api.UploadSummary
+}
+
+func (s *stubTrackers) Upload(ctx context.Context, meta api.PreparedMetadata) (api.UploadSummary, error) {
+	s.calls++
+	s.lastMeta = meta
+	if s.summary.Uploaded == 0 {
+		return api.UploadSummary{
+			Uploaded: 1,
+			UploadedTorrents: []api.UploadedTorrent{
+				{
+					Tracker:     "AITHER",
+					TorrentID:   "1234",
+					DownloadURL: "https://aither.cc/torrent/download/1234",
+					TorrentURL:  "https://aither.cc/torrents/1234",
+				},
+			},
+		}, nil
+	}
+	return s.summary, nil
+}
+
+func (s *stubTrackers) BuildPreparation(context.Context, api.PreparedMetadata, []string) (api.PreparationPreview, error) {
+	return api.PreparationPreview{}, nil
+}
+
+func (s *stubTrackers) BuildUploadDryRun(_ context.Context, meta api.PreparedMetadata, _ []string) ([]api.TrackerDryRunEntry, error) {
+	s.dryRunCalls++
+	s.lastMeta = meta
+	return []api.TrackerDryRunEntry{}, nil
+}

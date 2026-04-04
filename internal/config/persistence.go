@@ -1,0 +1,223 @@
+// Copyright (c) 2025-2026, Audionut and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+package config
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+
+	internalerrors "github.com/autobrr/upbrr/internal/errors"
+)
+
+// ExportToYAML writes the config to a YAML file.
+func ExportToYAML(cfg *Config, path string) error {
+	if cfg == nil {
+		return internalerrors.ErrInvalidInput
+	}
+	if path == "" {
+		return errors.New("config export: empty path")
+	}
+
+	// Ensure directory exists.
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("config export: mkdir: %w", err)
+	}
+
+	// Marshal to YAML.
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("config export: marshal yaml: %w", err)
+	}
+
+	// Write to file.
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("config export: write file: %w", err)
+	}
+
+	return nil
+}
+
+// ImportFromYAML reads the config from a YAML file.
+func ImportFromYAML(path string) (*Config, error) {
+	if path == "" {
+		return nil, errors.New("config import: empty path")
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, internalerrors.ErrNotFound
+		}
+		return nil, fmt.Errorf("config import: read file: %w", err)
+	}
+
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("config import: unmarshal yaml: %w", err)
+	}
+
+	return &cfg, nil
+}
+
+// ExportToJSON serializes the config to a JSON string.
+func ExportToJSON(cfg *Config) (string, error) {
+	if cfg == nil {
+		return "", internalerrors.ErrInvalidInput
+	}
+
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("config export: marshal json: %w", err)
+	}
+
+	return string(data), nil
+}
+
+// ImportFromJSON deserializes the config from a JSON string.
+func ImportFromJSON(payload string) (*Config, error) {
+	if payload == "" {
+		return nil, errors.New("config import: empty json")
+	}
+
+	var cfg Config
+	if err := json.Unmarshal([]byte(payload), &cfg); err != nil {
+		return nil, fmt.Errorf("config import: unmarshal json: %w", err)
+	}
+
+	return &cfg, nil
+}
+
+// BackupToYAML creates a timestamped YAML backup of the current config.
+// Returns the path to the backup file.
+func BackupToYAML(cfg *Config, baseDir string) (string, error) {
+	if cfg == nil {
+		return "", internalerrors.ErrInvalidInput
+	}
+	if baseDir == "" {
+		return "", errors.New("config backup: empty base directory")
+	}
+
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return "", fmt.Errorf("config backup: mkdir: %w", err)
+	}
+
+	// Create timestamped filename.
+	backupDir := filepath.Join(baseDir, "backups")
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		return "", fmt.Errorf("config backup: mkdir backups: %w", err)
+	}
+
+	backupPath := filepath.Join(backupDir, "config.yaml")
+	if err := ExportToYAML(cfg, backupPath); err != nil {
+		return "", fmt.Errorf("config backup: export: %w", err)
+	}
+
+	return backupPath, nil
+}
+
+// LoadFromDatabase loads the full config from the repository.
+func LoadFromDatabase(ctx context.Context, repo interface {
+	LoadFullConfig(ctx context.Context, dest interface{}) error
+}) (*Config, error) {
+	if repo == nil {
+		return nil, errors.New("config load: nil repository")
+	}
+
+	var cfg Config
+	if err := repo.LoadFullConfig(ctx, &cfg); err != nil {
+		return nil, fmt.Errorf("config load from database: %w", err)
+	}
+
+	return &cfg, nil
+}
+
+// SaveToDatabase persists the config to the repository.
+func SaveToDatabase(ctx context.Context, cfg *Config, repo interface {
+	SaveFullConfig(ctx context.Context, cfg interface{}) error
+}) error {
+	if cfg == nil {
+		return internalerrors.ErrInvalidInput
+	}
+	if repo == nil {
+		return errors.New("config save: nil repository")
+	}
+
+	if err := repo.SaveFullConfig(ctx, cfg); err != nil {
+		return fmt.Errorf("config save to database: %w", err)
+	}
+
+	return nil
+}
+
+// SaveSectionToDatabase persists a single config section to the repository.
+func SaveSectionToDatabase(ctx context.Context, section string, data interface{}, repo interface {
+	SaveConfigSection(ctx context.Context, section string, data interface{}) error
+}) error {
+	if section == "" {
+		return errors.New("config save section: empty section name")
+	}
+	if data == nil {
+		return internalerrors.ErrInvalidInput
+	}
+	if repo == nil {
+		return errors.New("config save section: nil repository")
+	}
+
+	if err := repo.SaveConfigSection(ctx, section, data); err != nil {
+		return fmt.Errorf("config save section %s to database: %w", section, err)
+	}
+
+	return nil
+}
+
+// LoadSectionFromDatabase retrieves a single config section from the repository.
+func LoadSectionFromDatabase(ctx context.Context, section string, dest interface{}, repo interface {
+	LoadConfigSection(ctx context.Context, section string, dest interface{}) error
+}) error {
+	if section == "" {
+		return errors.New("config load section: empty section name")
+	}
+	if dest == nil {
+		return internalerrors.ErrInvalidInput
+	}
+	if repo == nil {
+		return errors.New("config load section: nil repository")
+	}
+
+	if err := repo.LoadConfigSection(ctx, section, dest); err != nil {
+		return fmt.Errorf("config load section %s from database: %w", section, err)
+	}
+
+	return nil
+}
+
+// ExportFromDatabaseToYAML loads config from database, applies environment overrides,
+// and writes the resulting config to a YAML file.
+func ExportFromDatabaseToYAML(ctx context.Context, outputPath string, repo interface {
+	LoadFullConfig(ctx context.Context, dest interface{}) error
+}) error {
+	if strings.TrimSpace(outputPath) == "" {
+		return errors.New("config export from database: empty output path")
+	}
+
+	cfg, err := LoadFromDatabase(ctx, repo)
+	if err != nil {
+		return fmt.Errorf("config export from database: load: %w", err)
+	}
+
+	ApplyEnvOverrides(cfg)
+	if err := ExportToYAML(cfg, outputPath); err != nil {
+		return fmt.Errorf("config export from database: %w", err)
+	}
+
+	return nil
+}

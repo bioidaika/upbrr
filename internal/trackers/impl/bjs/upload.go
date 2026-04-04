@@ -1,0 +1,762 @@
+// Copyright (c) 2025-2026, Audionut and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+package bjs
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"github.com/autobrr/upbrr/internal/httpclient"
+	"github.com/autobrr/upbrr/internal/services/bbcode"
+	"github.com/autobrr/upbrr/internal/trackers"
+	"github.com/autobrr/upbrr/internal/trackers/impl/commonhttp"
+	"github.com/autobrr/upbrr/pkg/api"
+)
+
+const (
+	baseURL    = "https://bj-share.info"
+	uploadURL  = baseURL + "/upload.php"
+	torrentURL = baseURL + "/torrents.php?torrentid="
+	sourceFlag = "BJ"
+)
+
+var (
+	authPattern      = regexp.MustCompile(`name="auth"\s+value="([^"]+)"`)
+	idPattern        = regexp.MustCompile(`action=download&id=(\d+)|torrentid=(\d+)`)
+	durationPatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(?im)^duration(?:\s*/string\d*)?\s*:\s*(.+)$`),
+		regexp.MustCompile(`(?im)^duration\s*:\s*(.+)$`),
+	}
+	isoDurationPattern  = regexp.MustCompile(`(?i)^pt(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m)?(?:(\d+(?:\.\d+)?)s)?$`)
+	hoursPattern        = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|hr|h)\b`)
+	minutesPattern      = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(?:minutes?|mins?|min|mn)\b`)
+	secondsPattern      = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|sec|s)\b`)
+	millisecondsPattern = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*ms\b`)
+)
+
+type uploadState struct {
+	torrentPath   string
+	description   string
+	releaseName   string
+	fields        map[string]string
+	blockedReason string
+	questionnaire *api.TrackerQuestionnaire
+}
+
+func upload(ctx context.Context, req trackers.UploadRequest) (api.UploadSummary, error) {
+	state, cookies, err := prepareUploadState(ctx, req, false)
+	if err != nil {
+		return api.UploadSummary{}, err
+	}
+	if state.blockedReason != "" {
+		return api.UploadSummary{}, fmt.Errorf("trackers: BJS %s", state.blockedReason)
+	}
+	files := []commonhttp.FileField{{
+		FieldName: "file_input",
+		FileName:  filepath.Base(state.torrentPath),
+		Path:      state.torrentPath,
+	}}
+	body, contentType, err := commonhttp.BuildMultipartPayload(state.fields, files)
+	if err != nil {
+		return api.UploadSummary{}, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, bytes.NewReader(body))
+	if err != nil {
+		return api.UploadSummary{}, fmt.Errorf("trackers: BJS request build: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", contentType)
+	httpReq.Header.Set("User-Agent", "upbrr")
+	httpReq.Header.Set("Referer", uploadURL)
+	commonhttp.ApplyCookies(httpReq, cookies)
+	resp, err := httpclient.New(httpclient.DefaultTimeout).Do(httpReq)
+	if err != nil {
+		return api.UploadSummary{}, fmt.Errorf("trackers: BJS upload request: %w", err)
+	}
+	defer resp.Body.Close()
+	finalURL := ""
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	match := idPattern.FindStringSubmatch(finalURL + "\n" + string(responseBody))
+	id := firstNonEmpty(matchValue(match, 1), matchValue(match, 2))
+	if resp.StatusCode >= 200 && resp.StatusCode < 400 && id != "" {
+		tURL := torrentURL + id
+		artifactPath := ""
+		if announce := strings.TrimSpace(req.TrackerConfig.AnnounceURL); announce != "" {
+			artifactPath, err = trackers.ResolveTrackerTorrentArtifactPath(req.Meta, req.AppConfig.MainSettings.DBPath, "BJS")
+			if err != nil {
+				return api.UploadSummary{}, err
+			}
+			if err := trackers.WritePersonalizedTorrent(state.torrentPath, artifactPath, announce, tURL, sourceFlag); err != nil {
+				return api.UploadSummary{}, err
+			}
+		}
+		return api.UploadSummary{
+			Uploaded: 1,
+			UploadedTorrents: []api.UploadedTorrent{{
+				Tracker:     "BJS",
+				TorrentID:   id,
+				TorrentURL:  tURL,
+				DownloadURL: tURL,
+				TorrentPath: artifactPath,
+			}},
+		}, nil
+	}
+	_, _ = commonhttp.WriteFailureArtifact(req.Meta, req.AppConfig.MainSettings.DBPath, "BJS", "upload_failure", responseBody, ".html")
+	return api.UploadSummary{}, fmt.Errorf("trackers: BJS upload failed status=%d", resp.StatusCode)
+}
+
+func buildUploadDryRun(ctx context.Context, req trackers.UploadRequest) (api.TrackerDryRunEntry, error) {
+	state, _, err := prepareUploadState(ctx, req, true)
+	if err != nil {
+		return api.TrackerDryRunEntry{}, err
+	}
+	status := "ready"
+	message := "dry-run payload generated"
+	if state.blockedReason != "" {
+		status = "blocked"
+		message = state.blockedReason
+	}
+	return api.TrackerDryRunEntry{
+		Tracker:          "BJS",
+		Status:           status,
+		Message:          message,
+		ReleaseName:      state.releaseName,
+		DescriptionGroup: "bjs",
+		Description:      state.description,
+		Endpoint:         uploadURL,
+		Payload:          cloneFields(state.fields),
+		Questionnaire:    state.questionnaire,
+		Files:            []api.TrackerDryRunFile{{Field: "file_input", Path: state.torrentPath, Present: strings.TrimSpace(state.torrentPath) != ""}},
+	}, nil
+}
+
+func prepareUploadState(ctx context.Context, req trackers.UploadRequest, dryRun bool) (uploadState, []*http.Cookie, error) {
+	cookies, err := loadCookies(req.AppConfig.MainSettings.DBPath)
+	if err != nil {
+		return uploadState{}, nil, err
+	}
+	auth := "dry-run-auth"
+	if !dryRun {
+		auth, err = fetchAuth(ctx, cookies)
+		if err != nil {
+			return uploadState{}, nil, err
+		}
+	}
+	torrentPath, err := trackers.ResolveUploadTorrentPath(req.Meta, req.AppConfig.MainSettings.DBPath)
+	if err != nil {
+		return uploadState{}, nil, err
+	}
+	assets, err := trackers.ResolveDescriptionAssets(ctx, req.Tracker, req.Meta, req.Repo, req.Logger)
+	if err != nil {
+		assets = trackers.DescriptionAssets{}
+	}
+	description, err := buildDescription(req.Meta, assets)
+	if err != nil {
+		return uploadState{}, nil, err
+	}
+	fields := buildFields(req.Meta, description, auth, questionnaireAnswers(req.Meta))
+	state := uploadState{
+		torrentPath:   torrentPath,
+		description:   description,
+		releaseName:   firstNonEmpty(req.Meta.ReleaseName, req.Meta.Release.Title, req.Meta.Filename),
+		fields:        fields,
+		questionnaire: buildQuestionnaire(req.Meta, fields),
+	}
+	if reason := validateFields(fields); reason != "" {
+		state.blockedReason = reason
+	}
+	return state, cookies, nil
+}
+
+func buildFields(meta api.PreparedMetadata, description string, auth string, answers map[string]string) map[string]string {
+	width, height := resolveResolution(meta)
+	fields := map[string]string{
+		"audio":            resolveAudio(meta),
+		"auth":             auth,
+		"codecaudio":       resolveAudioCodec(meta),
+		"codecvideo":       resolveVideoCodec(meta),
+		"duracaoHR":        strconv.Itoa(resolveRuntime(meta) / 60),
+		"duracaoMIN":       strconv.Itoa(resolveRuntime(meta) % 60),
+		"duracaotipo":      "selectbox",
+		"fichatecnica":     description,
+		"formato":          resolveContainer(meta),
+		"idioma":           resolveLanguage(meta),
+		"imdblink":         resolveIDLink(meta),
+		"qualidade":        resolveQuality(meta),
+		"release":          strings.TrimSpace(meta.ServiceLongName),
+		"remaster_title":   strings.TrimSpace(meta.Edition),
+		"resolucaoh":       height,
+		"resolucaow":       width,
+		"sinopse":          firstNonEmpty(strings.TrimSpace(answers["overview"]), resolveOverview(meta)),
+		"submit":           "true",
+		"tags":             firstNonEmpty(strings.TrimSpace(answers["tags"]), resolveTags(meta)),
+		"tipolegenda":      resolveSubtitle(meta),
+		"title":            firstNonEmpty(meta.ExternalMetadata.TMDB.OriginalTitle, meta.Release.Title),
+		"titulobrasileiro": firstNonEmpty(meta.ExternalMetadata.TMDB.Title, meta.Release.Title),
+		"traileryoutube":   resolveYouTube(meta),
+		"type":             resolveType(meta),
+		"year":             resolveYearLabel(meta),
+	}
+	category := strings.ToUpper(strings.TrimSpace(categoryOf(meta)))
+	if category == "MOVIE" {
+		fields["adulto"] = resolveAdult(meta)
+		fields["diretor"] = resolveDirectors(meta)
+		fields["datalancamento"] = resolveReleaseDate(meta)
+	}
+	if category == "TV" {
+		fields["diretor"] = resolveCreators(meta)
+		if meta.TVPack {
+			fields["tipo"] = "season"
+		} else {
+			fields["tipo"] = "episode"
+		}
+		fields["season"] = strconv.Itoa(meta.SeasonInt)
+		fields["episode"] = strconv.Itoa(meta.EpisodeInt)
+		fields["network"] = resolveNetworks(meta)
+		fields["numtemporadas"] = strconv.Itoa(len(meta.ExternalMetadata.IMDB.SeasonsSummary))
+		fields["pais"] = strings.Join(meta.ExternalMetadata.TMDB.OriginCountry, ", ")
+		fields["diretorserie"] = resolveDirectors(meta)
+		fields["avaliacao"] = resolveIMDbRating(meta)
+		fields["datalancamento"] = resolveReleaseDate(meta)
+	}
+	if !meta.Anime {
+		fields["validimdb"] = "yes"
+		fields["imdbrating"] = resolveIMDbRating(meta)
+		fields["elenco"] = resolveCast(meta)
+	}
+	if meta.Anime && category == "MOVIE" {
+		fields["tipo"] = "movie"
+	}
+	if meta.Anime && category == "TV" {
+		fields["adulto"] = resolveAdult(meta)
+	}
+	if resolvePoster(meta) != "" {
+		fields["image"] = resolvePoster(meta)
+	}
+	screens := resolveScreens(meta)
+	if len(screens) > 0 {
+		fields["screenshots[]"] = strings.Join(screens, ",")
+	}
+	return fields
+}
+
+func buildQuestionnaire(meta api.PreparedMetadata, fields map[string]string) *api.TrackerQuestionnaire {
+	current := questionnaireAnswers(meta)
+	var items []api.TrackerQuestionnaireField
+	if strings.TrimSpace(fields["sinopse"]) == "" {
+		items = append(items, api.TrackerQuestionnaireField{Key: "overview", Label: "Overview", Kind: "textarea", Value: current["overview"], Required: true})
+	}
+	if strings.TrimSpace(fields["tags"]) == "" {
+		items = append(items, api.TrackerQuestionnaireField{Key: "tags", Label: "Tags", Kind: "text", Value: current["tags"], Required: true})
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	return &api.TrackerQuestionnaire{Tracker: "BJS", Fields: items}
+}
+
+func questionnaireAnswers(meta api.PreparedMetadata) map[string]string {
+	if len(meta.TrackerQuestionnaireAnswers) == 0 {
+		return nil
+	}
+	return meta.TrackerQuestionnaireAnswers["BJS"]
+}
+
+func validateFields(fields map[string]string) string {
+	if strings.TrimSpace(fields["imdblink"]) == "" {
+		return "missing IMDb or TMDb identifier"
+	}
+	if strings.TrimSpace(fields["sinopse"]) == "" {
+		return "missing overview"
+	}
+	if strings.TrimSpace(fields["diretor"]) == "" || strings.EqualFold(strings.TrimSpace(fields["diretor"]), "skipped") {
+		return "missing director/creator credits"
+	}
+	return ""
+}
+
+func buildDescription(meta api.PreparedMetadata, assets trackers.DescriptionAssets) (string, error) {
+	parts := make([]string, 0, 5)
+	if logo := resolveLogo(meta); logo != "" {
+		parts = append(parts, "[center][img]"+logo+"[/img][/center]")
+	}
+	if strings.TrimSpace(meta.EpisodeOverview) != "" {
+		parts = append(parts, "[center]"+strings.TrimSpace(meta.EpisodeTitle)+"[/center]\n[center]"+strings.TrimSpace(meta.EpisodeOverview)+"[/center]")
+	}
+	if strings.TrimSpace(assets.Description) != "" {
+		parts = append(parts, strings.TrimSpace(assets.Description))
+	}
+	return bbcode.FinalizeTrackerDescription("BJS", strings.TrimSpace(strings.Join(parts, "\n\n"))), nil
+}
+
+func loadCookies(dbPath string) ([]*http.Cookie, error) {
+	for _, candidate := range commonhttp.CookiePathCandidates(dbPath, "BJS", ".txt") {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return commonhttp.LoadNetscapeCookies(candidate, "bj-share.info")
+		}
+	}
+	return nil, errors.New("trackers: BJS cookie file not found")
+}
+
+func fetchAuth(ctx context.Context, cookies []*http.Cookie) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, uploadURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "upbrr")
+	commonhttp.ApplyCookies(req, cookies)
+	resp, err := httpclient.New(httpclient.DefaultTimeout).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	match := authPattern.FindStringSubmatch(string(body))
+	if len(match) < 2 {
+		return "", errors.New("trackers: BJS auth token not found")
+	}
+	return strings.TrimSpace(match[1]), nil
+}
+
+func resolveType(meta api.PreparedMetadata) string {
+	if meta.Anime {
+		return "13"
+	}
+	if strings.EqualFold(categoryOf(meta), "TV") {
+		return "1"
+	}
+	return "0"
+}
+
+func resolveContainer(meta api.PreparedMetadata) string {
+	container := strings.ToLower(strings.TrimSpace(meta.Container))
+	switch container {
+	case "mkv", "mp4", "avi", "vob", "m2ts", "ts":
+		return strings.ToUpper(container)
+	default:
+		return "Outro"
+	}
+}
+
+func resolveAudio(meta api.PreparedMetadata) string {
+	for _, lang := range meta.AudioLanguages {
+		lower := strings.ToLower(strings.TrimSpace(lang))
+		if lower == "portuguese" || lower == "português" || lower == "pt" {
+			if len(meta.AudioLanguages) > 1 {
+				return "Dual Áudio"
+			}
+			return "Dublado"
+		}
+	}
+	return "Legendado"
+}
+
+func resolveLanguage(meta api.PreparedMetadata) string {
+	if meta.ExternalMetadata.TMDB != nil {
+		switch strings.ToLower(strings.TrimSpace(meta.ExternalMetadata.TMDB.OriginalLanguage)) {
+		case "pt":
+			return "Português"
+		case "en":
+			return "Inglês"
+		case "ja":
+			return "Japonês"
+		case "ko":
+			return "Coreano"
+		default:
+			return strings.TrimSpace(meta.ExternalMetadata.TMDB.OriginalLanguage)
+		}
+	}
+	return "Outro"
+}
+
+func resolveSubtitle(meta api.PreparedMetadata) string {
+	for _, lang := range meta.SubtitleLanguages {
+		lower := strings.ToLower(strings.TrimSpace(lang))
+		if lower == "portuguese" || lower == "português" || lower == "pt" {
+			return "Embutida"
+		}
+	}
+	return "Nenhuma"
+}
+
+func resolveResolution(meta api.PreparedMetadata) (string, string) {
+	height := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSpace(meta.Release.Resolution), "p"), "i")
+	switch height {
+	case "2160":
+		return "3840", "2160"
+	case "1080":
+		return "1920", "1080"
+	case "720":
+		return "1280", "720"
+	default:
+		return "0", "0"
+	}
+}
+
+func resolveVideoCodec(meta api.PreparedMetadata) string {
+	value := strings.ToLower(strings.TrimSpace(firstNonEmpty(meta.VideoEncode, meta.VideoCodec)))
+	switch {
+	case strings.Contains(value, "265"), strings.Contains(value, "hevc"):
+		return "H.265"
+	case strings.Contains(value, "264"), strings.Contains(value, "avc"):
+		return "H.264"
+	case strings.Contains(value, "av1"):
+		return "AV1"
+	case strings.Contains(value, "vp9"):
+		return "VP9"
+	case strings.Contains(value, "xvid"):
+		return "XviD"
+	default:
+		return firstNonEmpty(meta.VideoCodec, "Outro")
+	}
+}
+
+func resolveAudioCodec(meta api.PreparedMetadata) string {
+	audio := strings.ToUpper(strings.TrimSpace(meta.Audio))
+	switch {
+	case strings.Contains(audio, "DTS:X"):
+		return "DTS-X"
+	case strings.Contains(audio, "ATMOS"):
+		return "E-AC-3 JOC"
+	case strings.Contains(audio, "TRUEHD"):
+		return "TrueHD"
+	case strings.Contains(audio, "DTS-HD"):
+		return "DTS-HD"
+	case strings.Contains(audio, "FLAC"):
+		return "FLAC"
+	case strings.Contains(audio, "LPCM"), strings.Contains(audio, "PCM"):
+		return "PCM"
+	case strings.Contains(audio, "DTS"):
+		return "DTS"
+	case strings.Contains(audio, "DD+"), strings.Contains(audio, "E-AC-3"):
+		return "E-AC-3"
+	case strings.Contains(audio, "DD"), strings.Contains(audio, "AC3"):
+		return "AC3"
+	case strings.Contains(audio, "AAC"):
+		return "AAC"
+	default:
+		return "Outro"
+	}
+}
+
+func resolveQuality(meta api.PreparedMetadata) string {
+	switch strings.ToUpper(strings.TrimSpace(meta.Type)) {
+	case "DISC":
+		if strings.EqualFold(strings.TrimSpace(meta.DiscType), "BDMV") {
+			if meta.SourceSize > 66<<30 {
+				return "BD100"
+			}
+			if meta.SourceSize > 50<<30 {
+				return "BD66"
+			}
+			if meta.SourceSize > 25<<30 {
+				return "BD50"
+			}
+			return "BD25"
+		}
+		return "DVD9"
+	case "REMUX":
+		return "Remux"
+	case "WEBDL":
+		return "WEB-DL"
+	case "WEBRIP":
+		return "WEBRip"
+	case "HDTV":
+		return "HDTV"
+	default:
+		return "Outro"
+	}
+}
+
+func resolveRuntime(meta api.PreparedMetadata) int {
+	for _, candidate := range []string{
+		commonhttp.ReadOptionalFile(meta.MediaInfoTextPath),
+		strings.TrimSpace(meta.DVDVOBMediaInfoText),
+	} {
+		if minutes := parseMediaInfoDurationMinutes(candidate); minutes > 0 {
+			return minutes
+		}
+	}
+	if meta.ExternalMetadata.IMDB != nil && meta.ExternalMetadata.IMDB.RuntimeMinutes > 0 {
+		return meta.ExternalMetadata.IMDB.RuntimeMinutes
+	}
+	if meta.ExternalMetadata.TMDB != nil {
+		return meta.ExternalMetadata.TMDB.Runtime
+	}
+	if meta.ExternalMetadata.TVmaze != nil {
+		return meta.ExternalMetadata.TVmaze.Runtime
+	}
+	return 0
+}
+
+func parseMediaInfoDurationMinutes(text string) int {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return 0
+	}
+	for _, pattern := range durationPatterns {
+		matches := pattern.FindStringSubmatch(trimmed)
+		if len(matches) < 2 {
+			continue
+		}
+		if minutes := parseDurationComponentString(matches[1]); minutes > 0 {
+			return minutes
+		}
+	}
+	return 0
+}
+
+func parseDurationComponentString(value string) int {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 0
+	}
+	if matches := isoDurationPattern.FindStringSubmatch(trimmed); len(matches) == 4 {
+		return roundedDurationMinutes(matches[1], matches[2], matches[3], "")
+	}
+	return roundedDurationMinutes(
+		firstMatch(hoursPattern, trimmed),
+		firstMatch(minutesPattern, trimmed),
+		firstMatch(secondsPattern, trimmed),
+		firstMatch(millisecondsPattern, trimmed),
+	)
+}
+
+func roundedDurationMinutes(hours string, minutes string, seconds string, milliseconds string) int {
+	totalSeconds := parseDurationComponent(hours) * 3600
+	totalSeconds += parseDurationComponent(minutes) * 60
+	totalSeconds += parseDurationComponent(seconds)
+	totalSeconds += parseDurationComponent(milliseconds) / 1000
+	if totalSeconds <= 0 {
+		return 0
+	}
+	return int(math.Round(totalSeconds / 60))
+}
+
+func parseDurationComponent(value string) float64 {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 0
+	}
+	parsed, err := strconv.ParseFloat(trimmed, 64)
+	if err != nil || parsed < 0 {
+		return 0
+	}
+	return parsed
+}
+
+func firstMatch(pattern *regexp.Regexp, value string) string {
+	matches := pattern.FindStringSubmatch(value)
+	if len(matches) < 2 {
+		return ""
+	}
+	return matches[1]
+}
+
+func resolveIDLink(meta api.PreparedMetadata) string {
+	if meta.ExternalIDs.IMDBID > 0 {
+		return fmt.Sprintf("tt%07d", meta.ExternalIDs.IMDBID)
+	}
+	if meta.ExternalIDs.TMDBID > 0 {
+		if strings.EqualFold(categoryOf(meta), "TV") {
+			return fmt.Sprintf("tv/%d", meta.ExternalIDs.TMDBID)
+		}
+		return fmt.Sprintf("movie/%d", meta.ExternalIDs.TMDBID)
+	}
+	return ""
+}
+
+func resolveOverview(meta api.PreparedMetadata) string {
+	if meta.ExternalMetadata.TMDB != nil {
+		return strings.TrimSpace(meta.ExternalMetadata.TMDB.Overview)
+	}
+	if meta.ExternalMetadata.IMDB != nil {
+		return strings.TrimSpace(meta.ExternalMetadata.IMDB.Plot)
+	}
+	return ""
+}
+
+func resolveTags(meta api.PreparedMetadata) string {
+	genreText := strings.TrimSpace(meta.Release.Genre)
+	if meta.ExternalMetadata.TMDB != nil && strings.TrimSpace(meta.ExternalMetadata.TMDB.Genres) != "" {
+		genreText = strings.TrimSpace(meta.ExternalMetadata.TMDB.Genres)
+	}
+	return strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(genreText, ", ", "."), " ", "."))
+}
+
+func resolveYouTube(meta api.PreparedMetadata) string {
+	if meta.ExternalMetadata.TMDB != nil {
+		return strings.TrimSpace(meta.ExternalMetadata.TMDB.YouTube)
+	}
+	return ""
+}
+
+func resolveNetworks(meta api.PreparedMetadata) string {
+	if meta.ExternalMetadata.TMDB != nil && len(meta.ExternalMetadata.TMDB.Networks) > 0 {
+		names := make([]string, 0, len(meta.ExternalMetadata.TMDB.Networks))
+		for _, n := range meta.ExternalMetadata.TMDB.Networks {
+			if strings.TrimSpace(n.Name) != "" {
+				names = append(names, strings.TrimSpace(n.Name))
+			}
+		}
+		return strings.Join(names, ", ")
+	}
+	return ""
+}
+
+func resolveReleaseDate(meta api.PreparedMetadata) string {
+	if meta.ExternalMetadata.TMDB != nil {
+		return firstNonEmpty(meta.ExternalMetadata.TMDB.ReleaseDate, meta.ExternalMetadata.TMDB.FirstAirDate)
+	}
+	return ""
+}
+
+func resolveYearLabel(meta api.PreparedMetadata) string {
+	year := resolveYear(meta)
+	if meta.ExternalMetadata.IMDB != nil && meta.ExternalMetadata.IMDB.EndYear > 0 {
+		return fmt.Sprintf("%d-%d", year, meta.ExternalMetadata.IMDB.EndYear)
+	}
+	return fmt.Sprintf("%d-", year)
+}
+
+func resolveYear(meta api.PreparedMetadata) int {
+	if meta.ExternalMetadata.TMDB != nil && meta.ExternalMetadata.TMDB.Year > 0 {
+		return meta.ExternalMetadata.TMDB.Year
+	}
+	if meta.ExternalMetadata.IMDB != nil && meta.ExternalMetadata.IMDB.Year > 0 {
+		return meta.ExternalMetadata.IMDB.Year
+	}
+	return meta.Release.Year
+}
+
+func resolveAdult(meta api.PreparedMetadata) string {
+	genres := strings.ToLower(resolveTags(meta) + " " + firstNonEmpty(meta.ExternalMetadata.TMDB.Keywords, ""))
+	if meta.Anime && strings.Contains(genres, "hentai") {
+		return "1"
+	}
+	for _, keyword := range []string{"xxx", "erotic", "porn", "adult", "orgy"} {
+		if strings.Contains(genres, keyword) {
+			return "1"
+		}
+	}
+	return "2"
+}
+
+func resolveDirectors(meta api.PreparedMetadata) string {
+	if meta.ExternalMetadata.TMDB != nil && len(meta.ExternalMetadata.TMDB.Directors) > 0 {
+		return strings.Join(meta.ExternalMetadata.TMDB.Directors, ", ")
+	}
+	if meta.ExternalMetadata.IMDB != nil {
+		names := make([]string, 0, len(meta.ExternalMetadata.IMDB.Directors))
+		for _, p := range meta.ExternalMetadata.IMDB.Directors {
+			if strings.TrimSpace(p.Name) != "" {
+				names = append(names, strings.TrimSpace(p.Name))
+			}
+		}
+		if len(names) > 0 {
+			return strings.Join(names, ", ")
+		}
+	}
+	return ""
+}
+
+func resolveCreators(meta api.PreparedMetadata) string {
+	if meta.ExternalMetadata.TMDB != nil && len(meta.ExternalMetadata.TMDB.Creators) > 0 {
+		return strings.Join(meta.ExternalMetadata.TMDB.Creators, ", ")
+	}
+	if meta.ExternalMetadata.IMDB != nil {
+		names := make([]string, 0, len(meta.ExternalMetadata.IMDB.Creators))
+		for _, p := range meta.ExternalMetadata.IMDB.Creators {
+			if strings.TrimSpace(p.Name) != "" {
+				names = append(names, strings.TrimSpace(p.Name))
+			}
+		}
+		return strings.Join(names, ", ")
+	}
+	return ""
+}
+
+func resolveCast(meta api.PreparedMetadata) string {
+	if meta.ExternalMetadata.TMDB != nil && len(meta.ExternalMetadata.TMDB.Cast) > 0 {
+		return strings.Join(meta.ExternalMetadata.TMDB.Cast, ", ")
+	}
+	if meta.ExternalMetadata.IMDB != nil {
+		names := make([]string, 0, len(meta.ExternalMetadata.IMDB.Stars))
+		for _, p := range meta.ExternalMetadata.IMDB.Stars {
+			if strings.TrimSpace(p.Name) != "" {
+				names = append(names, strings.TrimSpace(p.Name))
+			}
+		}
+		return strings.Join(names, ", ")
+	}
+	return ""
+}
+
+func resolveIMDbRating(meta api.PreparedMetadata) string {
+	if meta.ExternalMetadata.IMDB != nil && meta.ExternalMetadata.IMDB.Rating > 0 {
+		return strconv.FormatFloat(meta.ExternalMetadata.IMDB.Rating, 'f', 1, 64)
+	}
+	return ""
+}
+
+func resolveLogo(meta api.PreparedMetadata) string {
+	if meta.ExternalMetadata.TMDB != nil && strings.TrimSpace(meta.ExternalMetadata.TMDB.TMDBLogo) != "" {
+		return "https://image.tmdb.org/t/p/w300/" + strings.TrimPrefix(strings.TrimSpace(meta.ExternalMetadata.TMDB.TMDBLogo), "/")
+	}
+	return ""
+}
+
+func resolvePoster(meta api.PreparedMetadata) string {
+	if meta.ExternalMetadata.TMDB != nil {
+		return strings.TrimSpace(meta.ExternalMetadata.TMDB.Poster)
+	}
+	return ""
+}
+
+func resolveScreens(meta api.PreparedMetadata) []string {
+	return nil
+}
+
+func categoryOf(meta api.PreparedMetadata) string {
+	if category := strings.TrimSpace(meta.ExternalIDs.Category); category != "" {
+		return category
+	}
+	return strings.TrimSpace(meta.MediaInfoCategory)
+}
+
+func cloneFields(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func matchValue(values []string, idx int) string {
+	if idx >= 0 && idx < len(values) {
+		return values[idx]
+	}
+	return ""
+}

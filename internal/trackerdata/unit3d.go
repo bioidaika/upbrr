@@ -1,0 +1,722 @@
+// Copyright (c) 2025-2026, Audionut and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+package trackerdata
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
+	"io"
+	"net/http"
+	"net/url"
+	"path"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/autobrr/upbrr/internal/config"
+	"github.com/autobrr/upbrr/internal/services/bbcode"
+	descriptionunit3d "github.com/autobrr/upbrr/internal/services/description/unit3d"
+	"github.com/autobrr/upbrr/internal/trackers/unit3dmeta"
+	"github.com/autobrr/upbrr/pkg/api"
+)
+
+var knownNonUnit3DTrackers = map[string]struct{}{
+	"ANT": {}, "AR": {}, "ASC": {}, "AZ": {}, "BHD": {}, "BHDTV": {}, "BJS": {}, "BT": {},
+	"CZ": {}, "DC": {}, "FF": {}, "FL": {}, "GPW": {}, "HDB": {}, "HDS": {}, "HDT": {}, "IS": {},
+	"MTV": {}, "NBL": {}, "PHD": {}, "PTP": {}, "PTS": {}, "RTF": {}, "SPD": {}, "THR": {}, "TL": {},
+	"TVC": {}, "MANUAL": {},
+}
+
+const (
+	imageTimeout     = 15 * time.Second
+	maxImageBytes    = 20 * 1024 * 1024
+	imageConcurrency = 5
+)
+
+var unit3DCategoryNamesByID = map[string][]string{
+	"1": {"MOVIE"},
+	"2": {"TV"},
+}
+
+var unit3DTypeNamesByID = map[string][]string{
+	"1": {"DISC"},
+	"2": {"REMUX"},
+	"3": {"ENCODE", "DVDRIP"},
+	"4": {"WEBDL"},
+	"5": {"WEBRIP"},
+	"6": {"HDTV"},
+}
+
+var unit3DResolutionNamesByID = map[string][]string{
+	"10": {"8640P"},
+	"1":  {"4320P"},
+	"2":  {"2160P"},
+	"3":  {"1080P", "1440P"},
+	"4":  {"1080I"},
+	"5":  {"720P"},
+	"6":  {"576P"},
+	"7":  {"576I"},
+	"8":  {"480P"},
+	"9":  {"480I"},
+}
+
+func IsUnit3DTracker(tracker string) bool {
+	_, ok := baseURLForTracker(tracker)
+	return ok
+}
+
+func IsUnit3DTrackerWithConfig(cfg config.Config, tracker string) bool {
+	key := strings.ToUpper(strings.TrimSpace(tracker))
+	if key == "" {
+		return false
+	}
+	if IsUnit3DTracker(key) {
+		return true
+	}
+	if _, exists := knownNonUnit3DTrackers[key]; exists {
+		return false
+	}
+	entry, ok := cfg.Trackers.Trackers[key]
+	if !ok {
+		for name, candidate := range cfg.Trackers.Trackers {
+			if strings.EqualFold(name, key) {
+				entry = candidate
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok {
+		return false
+	}
+	if strings.TrimSpace(entry.APIKey) == "" {
+		return false
+	}
+	if strings.TrimSpace(entry.AnnounceURL) == "" {
+		return false
+	}
+	if strings.TrimSpace(entry.Username) != "" || strings.TrimSpace(entry.Password) != "" || strings.TrimSpace(entry.Passkey) != "" {
+		return false
+	}
+	if strings.TrimSpace(entry.ApiUser) != "" || strings.TrimSpace(entry.ApiKey) != "" {
+		return false
+	}
+	return true
+}
+
+func CategoryID(category string) string {
+	return reverseLookupCanonicalID(CanonicalUnit3DCategory(category), unit3DCategoryNamesByID)
+}
+
+func TypeID(typeValue string) string {
+	return reverseLookupCanonicalID(CanonicalUnit3DType(typeValue), unit3DTypeNamesByID)
+}
+
+func ResolutionID(value string) string {
+	return reverseLookupCanonicalID(CanonicalUnit3DResolution(value), unit3DResolutionNamesByID)
+}
+
+func CategoryName(id string) string {
+	return firstCanonicalValue(CategoryNames(id))
+}
+
+func CategoryNames(id string) []string {
+	return copyCanonicalValues(unit3DCategoryNamesByID[strings.TrimSpace(id)])
+}
+
+func TypeName(id string) string {
+	return firstCanonicalValue(TypeNames(id))
+}
+
+func TypeNames(id string) []string {
+	return copyCanonicalValues(unit3DTypeNamesByID[strings.TrimSpace(id)])
+}
+
+func ResolutionName(id string) string {
+	return firstCanonicalValue(ResolutionNames(id))
+}
+
+func ResolutionNames(id string) []string {
+	return copyCanonicalValues(unit3DResolutionNamesByID[strings.TrimSpace(id)])
+}
+
+func CanonicalUnit3DCategory(value string) string {
+	switch normalizeUnit3DLookupKey(value) {
+	case "MOVIE", "FILM":
+		return "MOVIE"
+	case "TV", "TELEVISION", "SHOW", "SERIES", "TVSHOW", "EPISODE":
+		return "TV"
+	default:
+		return ""
+	}
+}
+
+func CanonicalUnit3DType(value string) string {
+	switch normalizeUnit3DLookupKey(value) {
+	case "DISC":
+		return "DISC"
+	case "REMUX":
+		return "REMUX"
+	case "ENCODE":
+		return "ENCODE"
+	case "DVDRIP":
+		return "DVDRIP"
+	case "WEBDL":
+		return "WEBDL"
+	case "WEBRIP":
+		return "WEBRIP"
+	case "HDTV", "UHDTV":
+		return "HDTV"
+	default:
+		return ""
+	}
+}
+
+func CanonicalUnit3DResolution(value string) string {
+	switch normalizeUnit3DLookupKey(value) {
+	case "8640P":
+		return "8640P"
+	case "4320P":
+		return "4320P"
+	case "2160P":
+		return "2160P"
+	case "1440P":
+		return "1440P"
+	case "1080P":
+		return "1080P"
+	case "1080I":
+		return "1080I"
+	case "720P":
+		return "720P"
+	case "576P":
+		return "576P"
+	case "576I":
+		return "576I"
+	case "480P":
+		return "480P"
+	case "480I":
+		return "480I"
+	default:
+		return ""
+	}
+}
+
+func normalizeUnit3DLookupKey(value string) string {
+	return strings.NewReplacer("-", "", "_", "", " ", "").Replace(strings.ToUpper(strings.TrimSpace(value)))
+}
+
+func reverseLookupCanonicalID(canonical string, namesByID map[string][]string) string {
+	if canonical == "" {
+		return ""
+	}
+	for id, names := range namesByID {
+		for _, name := range names {
+			if name == canonical {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
+func firstCanonicalValue(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
+func copyCanonicalValues(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	return append([]string{}, values...)
+}
+
+func TrackerAPIKey(cfg config.Config, tracker string) string {
+	key := strings.ToUpper(strings.TrimSpace(tracker))
+	if key == "" {
+		return ""
+	}
+	if entry, ok := cfg.Trackers.Trackers[key]; ok {
+		return strings.TrimSpace(entry.APIKey)
+	}
+	if entry, ok := cfg.Trackers.Trackers[strings.ToLower(key)]; ok {
+		return strings.TrimSpace(entry.APIKey)
+	}
+	for name, entry := range cfg.Trackers.Trackers {
+		if strings.EqualFold(name, key) {
+			return strings.TrimSpace(entry.APIKey)
+		}
+	}
+	return ""
+}
+
+func (c *Client) TorrentInfo(ctx context.Context, tracker string, id string, fileName string, onlyID bool, keepImages bool) (Result, error) {
+	return c.lookupUnit3D(ctx, tracker, id, fileName, onlyID, keepImages)
+}
+
+func (c *Client) lookupUnit3D(ctx context.Context, tracker string, id string, fileName string, onlyID bool, keepImages bool) (Result, error) {
+	baseURL, ok := baseURLForTracker(tracker)
+	if !ok {
+		return Result{}, fmt.Errorf("unit3d: unknown tracker %q", tracker)
+	}
+
+	apiKey := strings.TrimSpace(TrackerAPIKey(c.cfg, tracker))
+	params := url.Values{}
+	if apiKey != "" {
+		params.Set("api_token", apiKey)
+	} else {
+		c.logger.Debugf("unit3d: %s missing api token; request may be unauthenticated", tracker)
+	}
+
+	endpoint := ""
+	switch {
+	case strings.TrimSpace(id) != "":
+		endpoint = baseURL + "/api/torrents/" + strings.TrimSpace(id)
+	case strings.TrimSpace(fileName) != "":
+		endpoint = baseURL + "/api/torrents/filter"
+		params.Set("file_name", fileName)
+	default:
+		return Result{}, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return Result{}, fmt.Errorf("unit3d: request: %w", err)
+	}
+	if len(params) > 0 {
+		req.URL.RawQuery = params.Encode()
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return Result{}, fmt.Errorf("unit3d: request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		c.logger.Debugf("unit3d: %s request failed (status=%d id=%q file=%q)", tracker, resp.StatusCode, strings.TrimSpace(id), strings.TrimSpace(fileName))
+		return Result{}, nil
+	}
+
+	var payload unit3dResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return Result{}, fmt.Errorf("unit3d: decode: %w", err)
+	}
+	attrs := payload.extractAttributes(strings.TrimSpace(id) != "")
+	if attrs == nil {
+		c.logger.Debugf("unit3d: %s response contained no attributes (id=%q file=%q)", tracker, strings.TrimSpace(id), strings.TrimSpace(fileName))
+		return Result{}, nil
+	}
+
+	result := Result{
+		TrackerID: strings.TrimSpace(id),
+		TMDBID:    attrs.tmdbID,
+		IMDBID:    attrs.imdbID,
+		TVDBID:    attrs.tvdbID,
+		MALID:     attrs.malID,
+		Category:  strings.TrimSpace(attrs.category),
+		InfoHash:  strings.TrimSpace(attrs.infoHash),
+		FileName:  attrs.fileName,
+	}
+
+	description := strings.TrimSpace(attrs.description)
+	if description == "" {
+		return result, nil
+	}
+	report := descriptionunit3d.CleanDescription(description, baseURL)
+	cleaned := report.Description
+	images := convertCleanedUnit3DImages(report.Images)
+	cleanedLen := len(cleaned)
+	imageCount := len(images)
+	validated := []bbcode.Image(nil)
+	if onlyID {
+		cleaned = ""
+	}
+	if keepImages {
+		validated = validateImages(ctx, c.http, images)
+		images = validated
+	} else {
+		images = nil
+	}
+	result.Description = cleaned
+	result.Images = images
+	result.Validated = validated
+	c.logger.Debugf("unit3d: %s description raw=%d cleaned=%d images=%d validated=%d onlyID=%t keepImages=%t", tracker, len(description), cleanedLen, imageCount, len(validated), onlyID, keepImages)
+	for _, note := range report.Notes {
+		c.logger.Debugf("unit3d: %s description note kind=%s msg=%s", tracker, note.Kind, note.Message)
+	}
+
+	return result, nil
+}
+
+func convertCleanedUnit3DImages(images []descriptionunit3d.Image) []bbcode.Image {
+	if len(images) == 0 {
+		return nil
+	}
+	converted := make([]bbcode.Image, 0, len(images))
+	for _, image := range images {
+		converted = append(converted, bbcode.Image{
+			ImgURL: image.ImgURL,
+			RawURL: image.RawURL,
+			WebURL: image.WebURL,
+			Host:   image.Host,
+		})
+	}
+	return converted
+}
+
+func (c *Client) SearchTorrents(ctx context.Context, tracker string, params url.Values, isDisc bool) ([]api.DupeEntry, string, error) {
+	baseURL, ok := baseURLForTrackerWithConfig(c.cfg, tracker)
+	if !ok {
+		return nil, "", fmt.Errorf("unit3d: unknown tracker %q", tracker)
+	}
+
+	apiKey := strings.TrimSpace(TrackerAPIKey(c.cfg, tracker))
+	if apiKey != "" {
+		params = cloneValues(params)
+		params.Set("api_token", apiKey)
+	} else if c.logger != nil {
+		c.logger.Debugf("unit3d: %s missing api token; request may be unauthenticated", tracker)
+	}
+
+	endpoint := strings.TrimRight(baseURL, "/") + path.Join("/", "api", "torrents", "filter")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("unit3d: request: %w", err)
+	}
+	if len(params) > 0 {
+		req.URL.RawQuery = params.Encode()
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("unit3d: request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if c.logger != nil {
+			c.logger.Debugf("unit3d: %s search failed (status=%d)", tracker, resp.StatusCode)
+		}
+		return nil, fmt.Sprintf("%s search failed (status=%d)", strings.ToUpper(strings.TrimSpace(tracker)), resp.StatusCode), nil
+	}
+
+	var payload unit3dSearchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, "", fmt.Errorf("unit3d: decode: %w", err)
+	}
+
+	entries := make([]api.DupeEntry, 0, len(payload.Data))
+	for _, item := range payload.Data {
+		entry := api.DupeEntry{
+			Name:        strings.TrimSpace(item.Attributes.Name),
+			Trumpable:   item.Attributes.Trumpable,
+			Link:        strings.TrimSpace(item.Attributes.DetailsLink),
+			Download:    strings.TrimSpace(item.Attributes.DownloadLink),
+			ID:          strings.TrimSpace(item.ID.String()),
+			Type:        strings.TrimSpace(item.Attributes.Type),
+			Res:         strings.TrimSpace(item.Attributes.Resolution),
+			Internal:    item.Attributes.Internal,
+			BDInfo:      strings.TrimSpace(item.Attributes.BDInfo),
+			Description: strings.TrimSpace(item.Attributes.Description),
+			Flags:       append([]string{}, item.Attributes.Flags...),
+		}
+
+		if sizeValue, err := parseNumberToInt64(item.Attributes.Size); err == nil {
+			entry.SizeBytes = sizeValue
+			entry.SizeKnown = sizeValue > 0
+		} else if raw := strings.TrimSpace(item.Attributes.Size.String()); raw != "" {
+			entry.SizeText = raw
+		}
+
+		if len(item.Attributes.Files) > 0 {
+			entry.FileCount = len(item.Attributes.Files)
+			if !isDisc {
+				entry.Files = make([]string, 0, len(item.Attributes.Files))
+				for _, file := range item.Attributes.Files {
+					trimmed := strings.TrimSpace(file.Name)
+					if trimmed != "" {
+						entry.Files = append(entry.Files, trimmed)
+					}
+				}
+			}
+		}
+
+		entries = append(entries, entry)
+	}
+
+	return entries, "", nil
+}
+
+func validateImages(ctx context.Context, client *http.Client, images []bbcode.Image) []bbcode.Image {
+	if len(images) == 0 {
+		return nil
+	}
+	if client == nil {
+		client = &http.Client{Timeout: imageTimeout}
+	}
+
+	results := make([]bbcode.Image, len(images))
+	valid := make([]bool, len(images))
+	sem := make(chan struct{}, imageConcurrency)
+	var wg sync.WaitGroup
+
+	for idx, img := range images {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if checkImage(ctx, client, img.RawURL) {
+				results[idx] = img
+				valid[idx] = true
+			}
+		}()
+	}
+	wg.Wait()
+
+	filtered := make([]bbcode.Image, 0, len(images))
+	for idx, ok := range valid {
+		if ok {
+			filtered = append(filtered, results[idx])
+		}
+	}
+	return filtered
+}
+
+func checkImage(ctx context.Context, client *http.Client, rawURL string) bool {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return false
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, trimmed, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	if resp.ContentLength > 0 && resp.ContentLength > maxImageBytes {
+		return false
+	}
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if contentType != "" && !strings.Contains(contentType, "image") {
+		return false
+	}
+	limited := io.LimitReader(resp.Body, maxImageBytes)
+	if _, _, err := image.DecodeConfig(limited); err != nil {
+		return false
+	}
+	return true
+}
+
+func baseURLForTracker(tracker string) (string, bool) {
+	return unit3dmeta.BaseURL(tracker)
+}
+
+func baseURLForTrackerWithConfig(cfg config.Config, tracker string) (string, bool) {
+	key := strings.ToUpper(strings.TrimSpace(tracker))
+	if key != "" {
+		if entry, ok := cfg.Trackers.Trackers[key]; ok {
+			if base := baseFromAnnounce(entry.AnnounceURL); base != "" {
+				return base, true
+			}
+		}
+		if entry, ok := cfg.Trackers.Trackers[strings.ToLower(key)]; ok {
+			if base := baseFromAnnounce(entry.AnnounceURL); base != "" {
+				return base, true
+			}
+		}
+		for name, entry := range cfg.Trackers.Trackers {
+			if strings.EqualFold(name, key) {
+				if base := baseFromAnnounce(entry.AnnounceURL); base != "" {
+					return base, true
+				}
+			}
+		}
+	}
+	return baseURLForTracker(tracker)
+}
+
+func baseFromAnnounce(announce string) string {
+	trimmed := strings.TrimSpace(announce)
+	if trimmed == "" {
+		return ""
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return ""
+	}
+	parsed.Path = "/"
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+func cloneValues(values url.Values) url.Values {
+	clone := url.Values{}
+	for key, list := range values {
+		for _, value := range list {
+			clone.Add(key, value)
+		}
+	}
+	return clone
+}
+
+func parseNumberToInt64(value json.Number) (int64, error) {
+	text := strings.TrimSpace(value.String())
+	if text == "" {
+		return 0, errors.New("empty number")
+	}
+	if parsed, err := strconv.ParseInt(text, 10, 64); err == nil {
+		return parsed, nil
+	}
+	parsed, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return 0, err
+	}
+	return int64(parsed), nil
+}
+
+type unit3dResponse struct {
+	Data       json.RawMessage `json:"data"`
+	Attributes json.RawMessage `json:"attributes"`
+}
+
+type unit3dDataItem struct {
+	Attributes unit3dAttributes `json:"attributes"`
+}
+
+type unit3dAttributes struct {
+	Category      string         `json:"category"`
+	Description   string         `json:"description"`
+	TMDBID        int            `json:"tmdb_id"`
+	IMDBID        int            `json:"imdb_id"`
+	TVDBID        int            `json:"tvdb_id"`
+	MALID         int            `json:"mal_id"`
+	InfoHash      string         `json:"info_hash"`
+	Files         []unit3dFile   `json:"files"`
+	RegionID      int            `json:"region_id"`
+	DistributorID int            `json:"distributor_id"`
+	RawFileName   string         `json:"file_name"`
+	ExtraFiles    []unit3dFile   `json:"file"`
+	Other         map[string]any `json:"-"`
+}
+
+type unit3dFile struct {
+	Name string `json:"name"`
+}
+
+type parsedAttributes struct {
+	category    string
+	description string
+	tmdbID      int
+	imdbID      int
+	tvdbID      int
+	malID       int
+	infoHash    string
+	fileName    string
+}
+
+func (r unit3dResponse) extractAttributes(preferTopLevel bool) *parsedAttributes {
+	if len(r.Data) > 0 {
+		var dataString string
+		if err := json.Unmarshal(r.Data, &dataString); err == nil {
+			if strings.TrimSpace(dataString) == "404" {
+				return nil
+			}
+		}
+		var dataItems []unit3dDataItem
+		if err := json.Unmarshal(r.Data, &dataItems); err == nil {
+			if len(dataItems) > 0 {
+				return parseAttributes(dataItems[0].Attributes)
+			}
+		}
+	}
+
+	if !preferTopLevel || len(r.Attributes) == 0 {
+		return nil
+	}
+	var attrs unit3dAttributes
+	if err := json.Unmarshal(r.Attributes, &attrs); err != nil {
+		return nil
+	}
+	return parseAttributes(attrs)
+}
+
+func parseAttributes(attrs unit3dAttributes) *parsedAttributes {
+	info := &parsedAttributes{
+		category:    attrs.Category,
+		description: attrs.Description,
+		infoHash:    attrs.InfoHash,
+	}
+	info.tmdbID = normalizeID(attrs.TMDBID)
+	info.imdbID = normalizeID(attrs.IMDBID)
+	info.tvdbID = normalizeID(attrs.TVDBID)
+	info.malID = normalizeID(attrs.MALID)
+
+	fileNames := make([]string, 0, len(attrs.Files))
+	for _, file := range attrs.Files {
+		trimmed := strings.TrimSpace(file.Name)
+		if trimmed == "" {
+			continue
+		}
+		fileNames = append(fileNames, trimmed)
+		if len(fileNames) >= 5 {
+			break
+		}
+	}
+	if len(fileNames) == 1 {
+		info.fileName = fileNames[0]
+	} else if len(fileNames) > 1 {
+		info.fileName = strings.Join(fileNames, ", ")
+	}
+	if info.fileName == "" {
+		info.fileName = strings.TrimSpace(attrs.RawFileName)
+	}
+	return info
+}
+
+func normalizeID(value int) int {
+	if value <= 0 {
+		return 0
+	}
+	return value
+}
+
+type unit3dSearchResponse struct {
+	Data []unit3dSearchItem `json:"data"`
+}
+
+type unit3dSearchItem struct {
+	ID         json.Number       `json:"id"`
+	Attributes unit3dSearchAttrs `json:"attributes"`
+}
+
+type unit3dSearchAttrs struct {
+	Name         string       `json:"name"`
+	Size         json.Number  `json:"size"`
+	Files        []unit3dFile `json:"files"`
+	Trumpable    bool         `json:"trumpable"`
+	DetailsLink  string       `json:"details_link"`
+	DownloadLink string       `json:"download_link"`
+	Type         string       `json:"type"`
+	Resolution   string       `json:"resolution"`
+	Internal     bool         `json:"internal"`
+	BDInfo       string       `json:"bd_info"`
+	Description  string       `json:"description"`
+	Flags        []string     `json:"flags"`
+}

@@ -1,0 +1,110 @@
+// Copyright (c) 2025-2026, Audionut and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+package trackers
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"github.com/autobrr/upbrr/internal/services/db"
+)
+
+type BannedGroupChecker struct {
+	basePath string
+	mu       sync.Mutex
+	cache    map[string]map[string]struct{}
+}
+
+type bannedGroupsFile struct {
+	BannedGroups string `json:"banned_groups"`
+}
+
+func NewBannedGroupChecker(dbPath string) *BannedGroupChecker {
+	basePath, err := db.Subdir(dbPath, "cache")
+	if err != nil {
+		return nil
+	}
+	basePath = filepath.Join(basePath, "banned")
+	return &BannedGroupChecker{basePath: basePath, cache: make(map[string]map[string]struct{})}
+}
+
+func (c *BannedGroupChecker) IsBanned(tracker, group string) (bool, error) {
+	if c == nil {
+		return false, nil
+	}
+	tracker = strings.ToUpper(strings.TrimSpace(tracker))
+	group = strings.ToLower(strings.TrimSpace(group))
+	if tracker == "" || group == "" {
+		return false, nil
+	}
+
+	groups, err := c.load(tracker)
+	if err != nil {
+		return false, err
+	}
+	_, found := groups[group]
+	return found, nil
+}
+
+func (c *BannedGroupChecker) load(tracker string) (map[string]struct{}, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if cached, ok := c.cache[tracker]; ok {
+		return cached, nil
+	}
+
+	groups := map[string]struct{}{}
+	if builtin := builtinBannedGroups[tracker]; len(builtin) > 0 {
+		for _, value := range builtin {
+			cleaned := strings.ToLower(strings.TrimSpace(value))
+			if cleaned != "" {
+				groups[cleaned] = struct{}{}
+			}
+		}
+		c.cache[tracker] = groups
+		return groups, nil
+	}
+
+	filePath := filepath.Join(c.basePath, tracker+"_banned_groups.json")
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			c.cache[tracker] = groups
+			return groups, nil
+		}
+		return nil, err
+	}
+
+	var payload bannedGroupsFile
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, err
+	}
+
+	for _, value := range strings.Split(payload.BannedGroups, ",") {
+		cleaned := strings.ToLower(strings.TrimSpace(value))
+		if cleaned == "" {
+			continue
+		}
+		groups[cleaned] = struct{}{}
+	}
+
+	c.cache[tracker] = groups
+	return groups, nil
+}
+
+var builtinBannedGroups = map[string][]string{
+	"TOS": {
+		"FL3ER",
+		"SUNS3T",
+		"WoLFHD",
+		"EXTREME",
+		"Slay3R",
+		"3T3AM",
+		"BARBiE",
+	},
+}

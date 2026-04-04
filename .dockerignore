@@ -1,0 +1,8 @@
+.git
+.github
+dist
+gui/build
+gui/frontend/node_modules
+gui/frontend/dist
+**/*.log
+**/.DS_Store

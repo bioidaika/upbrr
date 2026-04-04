@@ -1,0 +1,9 @@
+gui/frontend/node_modules/
+gui/frontend/dist/
+gui/build/bin/
+internal/webserver/assets/
+internal/guiapp/assets/*
+!internal/guiapp/assets/.keep
+dist/
+.trunk/
+*.exe

@@ -1,0 +1,153 @@
+// Copyright (c) 2025-2026, Audionut and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+package trackerdata
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/autobrr/upbrr/internal/config"
+)
+
+func TestIsUnit3DTracker(t *testing.T) {
+	t.Parallel()
+
+	if !IsUnit3DTracker("BLU") {
+		t.Fatalf("expected BLU to be a Unit3D tracker")
+	}
+	if !IsUnit3DTracker("ACM") {
+		t.Fatalf("expected ACM to be a Unit3D tracker")
+	}
+	if IsUnit3DTracker("PTP") {
+		t.Fatalf("did not expect PTP to be a Unit3D tracker")
+	}
+}
+
+func TestUnit3DMappings(t *testing.T) {
+	t.Parallel()
+
+	if got := CategoryID("movie"); got != "1" {
+		t.Fatalf("category id mismatch: %q", got)
+	}
+	if got := TypeID("webdl"); got != "4" {
+		t.Fatalf("type id mismatch: %q", got)
+	}
+	if got := ResolutionID("2160p"); got != "2" {
+		t.Fatalf("resolution id mismatch: %q", got)
+	}
+	if got := TypeID("web-dl"); got != "4" {
+		t.Fatalf("type id alias mismatch: %q", got)
+	}
+	if got := ResolutionID("1080P"); got != "3" {
+		t.Fatalf("resolution id alias mismatch: %q", got)
+	}
+}
+
+func TestUnit3DReverseMappings(t *testing.T) {
+	t.Parallel()
+
+	if got := CategoryName("1"); got != "MOVIE" {
+		t.Fatalf("category name mismatch: %q", got)
+	}
+	if got := TypeName("4"); got != "WEBDL" {
+		t.Fatalf("type name mismatch: %q", got)
+	}
+	resolutions := ResolutionNames("3")
+	if len(resolutions) != 2 || resolutions[0] != "1080P" || resolutions[1] != "1440P" {
+		t.Fatalf("resolution names mismatch: %#v", resolutions)
+	}
+	if got := ResolutionName("99"); got != "" {
+		t.Fatalf("expected unknown resolution id to return empty, got %q", got)
+	}
+}
+
+func TestExtractAttributesFromDataAndTopLevel(t *testing.T) {
+	t.Parallel()
+
+	resp := unit3dResponse{
+		Data: json.RawMessage(`[{"attributes":{"tmdb_id":12,"imdb_id":34,"tvdb_id":56,"mal_id":78,"description":"desc"}}]`),
+	}
+	attrs := resp.extractAttributes(false)
+	if attrs == nil || attrs.tmdbID != 12 || attrs.imdbID != 34 || attrs.tvdbID != 56 || attrs.malID != 78 {
+		t.Fatalf("unexpected attrs from data: %+v", attrs)
+	}
+
+	top := unit3dResponse{
+		Attributes: json.RawMessage(`{"tmdb_id":1,"description":"top"}`),
+	}
+	topAttrs := top.extractAttributes(true)
+	if topAttrs == nil || topAttrs.tmdbID != 1 {
+		t.Fatalf("unexpected attrs from top-level: %+v", topAttrs)
+	}
+}
+
+func TestExtractAttributesHandles404AndMissing(t *testing.T) {
+	t.Parallel()
+
+	resp := unit3dResponse{Data: json.RawMessage(`"404"`)}
+	if attrs := resp.extractAttributes(false); attrs != nil {
+		t.Fatalf("expected nil attrs for 404 payload, got %+v", attrs)
+	}
+
+	empty := unit3dResponse{}
+	if attrs := empty.extractAttributes(true); attrs != nil {
+		t.Fatalf("expected nil attrs for empty payload, got %+v", attrs)
+	}
+}
+
+func TestParseNumberToInt64(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		value   json.Number
+		want    int64
+		wantErr bool
+	}{
+		{value: json.Number("12"), want: 12},
+		{value: json.Number("12.9"), want: 12},
+		{value: json.Number(""), wantErr: true},
+	}
+
+	for _, tc := range cases {
+		got, err := parseNumberToInt64(tc.value)
+		if tc.wantErr {
+			if err == nil {
+				t.Fatalf("expected error for %q", tc.value.String())
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("unexpected error for %q: %v", tc.value.String(), err)
+		}
+		if got != tc.want {
+			t.Fatalf("value mismatch for %q: got %d want %d", tc.value.String(), got, tc.want)
+		}
+	}
+}
+
+func TestIsUnit3DTrackerWithConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{
+		Trackers: config.TrackersConfig{
+			Trackers: map[string]config.TrackerConfig{
+				"CUSTOM": {
+					APIKey:      "token",
+					AnnounceURL: "https://custom.unit3d.example/announce",
+				},
+				"BHD": {
+					APIKey:      "token",
+					AnnounceURL: "https://beyond-hd.me/announce",
+				},
+			},
+		},
+	}
+
+	if !IsUnit3DTrackerWithConfig(cfg, "CUSTOM") {
+		t.Fatalf("expected CUSTOM to be detected as Unit3D by config")
+	}
+	if IsUnit3DTrackerWithConfig(cfg, "BHD") {
+		t.Fatalf("did not expect BHD to be detected as Unit3D")
+	}
+}
