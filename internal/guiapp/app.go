@@ -584,7 +584,7 @@ func (a *App) FetchPreparation(path string, overrides api.ExternalIDOverrides, n
 	return a.core.FetchPreparationPreview(progressCtx, req)
 }
 
-func (a *App) FetchTrackerDryRun(path string, overrides api.ExternalIDOverrides, nameOverrides api.ReleaseNameOverrides, trackers []string, ignoreRuleFailures bool, ignoreDupesFor []string, questionnaireAnswers map[string]map[string]string, debug bool, runLogLevel string) (api.TrackerDryRunPreview, error) {
+func (a *App) FetchTrackerDryRun(path string, overrides api.ExternalIDOverrides, nameOverrides api.ReleaseNameOverrides, trackers []string, ignoreRuleFailures bool, ignoreDupesFor []string, questionnaireAnswers map[string]map[string]string, descriptionGroups []api.DescriptionBuilderGroup, debug bool, runLogLevel string) (api.TrackerDryRunPreview, error) {
 	if err := a.requireCore(); err != nil {
 		return api.TrackerDryRunPreview{}, err
 	}
@@ -618,6 +618,7 @@ func (a *App) FetchTrackerDryRun(path string, overrides api.ExternalIDOverrides,
 	req := api.Request{
 		Paths:                       []string{trimmedPath},
 		Mode:                        api.ModeGUI,
+		DescriptionGroups:           api.CloneDescriptionBuilderGroups(descriptionGroups),
 		Trackers:                    trackers,
 		IgnoreDupesFor:              normalizeTrackerList(ignoreDupesFor),
 		IgnoreTrackerRuleFailures:   ignoreRuleFailures,
@@ -691,12 +692,12 @@ func (a *App) RenderDescription(raw string) (string, error) {
 	return a.core.RenderDescription(ctx, raw)
 }
 
-func (a *App) SaveDescriptionOverride(path string, raw string) error {
+func (a *App) SaveDescriptionOverride(path string, groupKey string, raw string, trackers []string, overrides api.ExternalIDOverrides, nameOverrides api.ReleaseNameOverrides) (api.DescriptionBuilderGroup, error) {
 	if a == nil || a.core == nil {
-		return errors.New("app not initialized")
+		return api.DescriptionBuilderGroup{}, errors.New("app not initialized")
 	}
 	if strings.TrimSpace(path) == "" {
-		return errors.New("path is required")
+		return api.DescriptionBuilderGroup{}, errors.New("path is required")
 	}
 
 	ctx := a.ctx
@@ -707,9 +708,14 @@ func (a *App) SaveDescriptionOverride(path string, raw string) error {
 	defer cancel()
 
 	req := api.Request{
-		Paths: []string{path},
-		Mode:  api.ModeGUI,
+		Paths:                    []string{path},
+		Mode:                     api.ModeGUI,
+		DescriptionOverrideGroup: strings.TrimSpace(groupKey),
 	}
+
+	req.Trackers = append([]string{}, trackers...)
+	req.ExternalIDOverrides = overrides
+	req.ReleaseNameOverrides = nameOverrides
 
 	return a.core.SaveDescriptionOverride(ctx, req, raw)
 }
