@@ -302,14 +302,15 @@ func (s *Service) lookupTrackerData(
 	}
 
 	if trackerdata.IsUnit3DTracker(tracker) {
+		fileName := trackerLookupFileName(meta, record.TrackerID, s.cfg.Metadata.SkipTrackerFilenameLookup)
 		if s.logger != nil {
-			s.logger.Tracef("metadata: unit3d lookup start tracker=%s id=%q file=%q", tracker, record.TrackerID, searchFileName(meta))
+			s.logger.Tracef("metadata: unit3d lookup start tracker=%s id=%q file=%q", tracker, record.TrackerID, fileName)
 		}
 		result, err := unit3dClient.TorrentInfo(
 			ctx,
 			tracker,
 			record.TrackerID,
-			searchFileName(meta),
+			fileName,
 			meta.Options.OnlyID,
 			meta.Options.KeepImages,
 		)
@@ -382,7 +383,7 @@ func (s *Service) lookupTrackerData(
 		tracker,
 		record.TrackerID,
 		meta,
-		searchFileName(meta),
+		trackerLookupFileName(meta, record.TrackerID, s.cfg.Metadata.SkipTrackerFilenameLookup),
 		meta.Options.OnlyID,
 		meta.Options.KeepImages,
 	)
@@ -839,6 +840,13 @@ func searchFileName(meta api.PreparedMetadata) string {
 		return ""
 	}
 	return pathutil.Base(base)
+}
+
+func trackerLookupFileName(meta api.PreparedMetadata, trackerID string, skipFilenameLookup bool) string {
+	if skipFilenameLookup && strings.TrimSpace(trackerID) == "" {
+		return ""
+	}
+	return searchFileName(meta)
 }
 
 func normalizeUnit3DCategory(category string) api.Category {
