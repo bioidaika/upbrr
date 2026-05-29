@@ -24,6 +24,7 @@ import (
 
 	"github.com/autobrr/upbrr/internal/config"
 	cookiepkg "github.com/autobrr/upbrr/internal/cookies"
+	"github.com/autobrr/upbrr/internal/metadata/metautil"
 	"github.com/autobrr/upbrr/internal/paths"
 	"github.com/autobrr/upbrr/internal/pathutil"
 	"github.com/autobrr/upbrr/internal/services/db"
@@ -100,7 +101,7 @@ func upload(ctx context.Context, req trackers.UploadRequest) (api.UploadSummary,
 				return api.UploadSummary{}, fmt.Errorf("trackers: %w", err)
 			}
 		}
-		id := firstNonEmpty(torrentID, groupID)
+		id := metautil.FirstNonEmptyTrimmed(torrentID, groupID)
 		return api.UploadSummary{
 			Uploaded: 1,
 			UploadedTorrents: []api.UploadedTorrent{{
@@ -210,7 +211,7 @@ func prepareUploadState(ctx context.Context, req trackers.UploadRequest, dryRun 
 
 func buildDescription(meta api.PreparedMetadata, dbPath string, assets trackers.DescriptionAssets) string {
 	var parts []string
-	title := firstNonEmpty(strings.TrimSpace(meta.ReleaseName), strings.TrimSpace(meta.Release.Title), pathutil.Base(meta.SourcePath))
+	title := metautil.FirstNonEmptyTrimmed(strings.TrimSpace(meta.ReleaseName), strings.TrimSpace(meta.Release.Title), pathutil.Base(meta.SourcePath))
 	parts = append(parts, fmt.Sprintf("[color=green][size=6]%s[/size][/color]", title))
 
 	if links := buildDatabaseLinks(meta); links != "" {
@@ -224,7 +225,7 @@ func buildDescription(meta api.PreparedMetadata, dbPath string, assets trackers.
 		mediaLabel = "BDINFO"
 		mediaText, _ = readBDSummary(meta, dbPath)
 	case "DVD":
-		mediaText = firstNonEmpty(strings.TrimSpace(meta.DVDVOBMediaInfoText), readTextFileNoErr(strings.TrimSpace(meta.MediaInfoTextPath)))
+		mediaText = metautil.FirstNonEmptyTrimmed(strings.TrimSpace(meta.DVDVOBMediaInfoText), readTextFileNoErr(strings.TrimSpace(meta.MediaInfoTextPath)))
 	default:
 		mediaText = readTextFileNoErr(strings.TrimSpace(meta.MediaInfoTextPath))
 	}
@@ -806,15 +807,6 @@ func uniqueStrings(values []string) []string {
 		result = append(result, trimmed)
 	}
 	return result
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
 }
 
 func matchAt(values []string, idx int) string {

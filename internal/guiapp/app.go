@@ -173,6 +173,32 @@ func videoFileDialogFilter() runtime.FileFilter {
 	}
 }
 
+func (a *App) BrowseFiles() ([]string, error) {
+	return a.BrowseImageFiles()
+}
+
+func (a *App) BrowseImageFiles() ([]string, error) {
+	if a == nil {
+		return nil, errors.New("app not initialized")
+	}
+	ctx, err := a.readyRuntimeContext()
+	if err != nil {
+		return nil, err
+	}
+
+	selection, err := runtime.OpenMultipleFilesDialog(ctx, runtime.OpenDialogOptions{
+		Title: "Select images",
+		Filters: []runtime.FileFilter{
+			{DisplayName: "Image files", Pattern: "*.png;*.jpg;*.jpeg;*.webp"},
+			{DisplayName: "All files", Pattern: "*.*"},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("gui: open files dialog: %w", err)
+	}
+	return selection, nil
+}
+
 func (a *App) BrowseFolder() (string, error) {
 	if a == nil {
 		return "", errors.New("app not initialized")
@@ -1148,6 +1174,33 @@ func (a *App) SaveFinalScreenshotSelections(path string, overrides api.ExternalI
 	}
 
 	return wrapGUIError(a.core.SaveFinalScreenshotSelections(ctx, req, images))
+}
+
+func (a *App) ImportMenuImages(path string, overrides api.ExternalIDOverrides, nameOverrides api.ReleaseNameOverrides, paths []string) error {
+	if a == nil || a.core == nil {
+		return errors.New("app not initialized")
+	}
+	if strings.TrimSpace(path) == "" {
+		return errors.New("path is required")
+	}
+
+	ctx := a.runtimeContext()
+	ctx, cancel := context.WithTimeout(ctx, previewTimeout)
+	defer cancel()
+
+	req := api.Request{
+		Paths: []string{path},
+		Mode:  api.ModeGUI,
+		Options: api.UploadOptions{
+			Screens:    a.cfg.ScreenshotHandling.Screens,
+			OnlyID:     a.cfg.Metadata.OnlyID,
+			KeepImages: a.cfg.Metadata.KeepImages,
+		},
+		ExternalIDOverrides:  overrides,
+		ReleaseNameOverrides: nameOverrides,
+	}
+
+	return wrapGUIError(a.core.ImportMenuImages(ctx, req, paths))
 }
 
 func (a *App) ReadScreenshotImage(path string) (string, error) {

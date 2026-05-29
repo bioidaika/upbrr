@@ -29,6 +29,7 @@ import (
 	internalerrors "github.com/autobrr/upbrr/internal/errors"
 	"github.com/autobrr/upbrr/internal/filesystem"
 	"github.com/autobrr/upbrr/internal/metadata"
+	"github.com/autobrr/upbrr/internal/paths"
 	"github.com/autobrr/upbrr/internal/services/bdinfo"
 	"github.com/autobrr/upbrr/internal/services/db"
 	"github.com/autobrr/upbrr/internal/services/description"
@@ -237,6 +238,12 @@ func (c *Core) RunUploadPrepared(ctx context.Context, req api.Request) (api.Resu
 		}
 		if !ok {
 			return api.Result{}, fmt.Errorf("core: upload-only requires prepared metadata for %s", path)
+		}
+
+		if len(singleReq.ScreenshotOverrides.MenuPaths) > 0 {
+			if err := c.ImportMenuImages(ctx, singleReq, singleReq.ScreenshotOverrides.MenuPaths); err != nil {
+				return api.Result{}, fmt.Errorf("core: import menu images failed: %w", err)
+			}
 		}
 
 		uploaded, err := c.executePreparedUpload(ctx, singleReq, meta)
@@ -836,6 +843,105 @@ func (c *Core) SaveFinalScreenshotSelections(ctx context.Context, req api.Reques
 	}
 
 	return wrapCoreError(c.services.Screenshots.SaveFinalSelections(ctx, meta, images))
+}
+
+func (c *Core) ImportMenuImages(ctx context.Context, req api.Request, importPaths []string) error {
+	if len(req.Paths) == 0 {
+		return internalerrors.ErrInvalidInput
+	}
+	if len(importPaths) == 0 {
+		return nil
+	}
+	normalizedPaths, err := c.services.Filesystem.ValidatePaths(ctx, req.Paths)
+	if err != nil {
+		return fmt.Errorf("core: validate menu paths: %w", err)
+	}
+	uniquePaths := make([]string, 0, len(normalizedPaths))
+	seenPaths := make(map[string]struct{}, len(normalizedPaths))
+	for _, path := range normalizedPaths {
+		if _, exists := seenPaths[path]; exists {
+			continue
+		}
+		seenPaths[path] = struct{}{}
+		uniquePaths = append(uniquePaths, path)
+	}
+	if len(uniquePaths) != 1 {
+		return internalerrors.ErrInvalidInput
+	}
+	sourcePath := uniquePaths[0]
+
+	existing, err := c.repo.ListFinalSelections(ctx, sourcePath)
+	if err != nil && !errors.Is(err, internalerrors.ErrNotFound) {
+		return fmt.Errorf("core: list menu selections: %w", err)
+	}
+	maxOrder := -1
+	for _, sel := range existing {
+		if sel.Order > maxOrder {
+			maxOrder = sel.Order
+		}
+	}
+
+	var expandedPaths []string
+	for _, p := range importPaths {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		info, err := os.Stat(p)
+		if err != nil {
+			return fmt.Errorf("stat menu path %s: %w", p, err)
+		}
+		if info.IsDir() {
+			entries, err := os.ReadDir(p)
+			if err != nil {
+				return fmt.Errorf("read menu dir %s: %w", p, err)
+			}
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					ext := strings.ToLower(filepath.Ext(entry.Name()))
+					if ext == ".png" || ext == ".jpg" || ext == ".jpeg" {
+						expandedPaths = append(expandedPaths, filepath.Join(p, entry.Name()))
+					}
+				}
+			}
+		} else {
+			ext := strings.ToLower(filepath.Ext(p))
+			if ext == ".png" || ext == ".jpg" || ext == ".jpeg" {
+				expandedPaths = append(expandedPaths, p)
+			}
+		}
+	}
+
+	tmpRoot, err := db.Subdir(c.cfg.MainSettings.DBPath, "tmp")
+	if err != nil {
+		return fmt.Errorf("core: resolve tmp root: %w", err)
+	}
+
+	tmpDir, _, err := paths.ReleaseTempDir(tmpRoot, api.PreparedMetadata{}, sourcePath)
+	if err != nil {
+		return fmt.Errorf("core: create release tmp dir: %w", err)
+	}
+
+	for idx, p := range expandedPaths {
+		destPath := filepath.Join(tmpDir, filepath.Base(p))
+
+		// Copy file to release tmp dir
+		if err := filesystem.CopyFile(p, destPath); err != nil {
+			return fmt.Errorf("core: copy menu image %s: %w", p, err)
+		}
+
+		existing = append(existing, api.ScreenshotFinalSelection{
+			SourcePath: sourcePath,
+			ImagePath:  destPath,
+			Order:      maxOrder + 1 + idx,
+			Source:     string(api.ScreenshotPurposeMenu),
+			SelectedAt: time.Now().UTC(),
+		})
+	}
+	if err := c.repo.SaveFinalSelections(ctx, sourcePath, existing); err != nil {
+		return fmt.Errorf("core: save menu selections: %w", err)
+	}
+	return nil
 }
 
 func (c *Core) ListUploadCandidates(ctx context.Context, req api.Request) ([]api.ScreenshotImage, error) {

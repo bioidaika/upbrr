@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/autobrr/upbrr/internal/httpclient"
+	"github.com/autobrr/upbrr/internal/metadata/metautil"
 	"github.com/autobrr/upbrr/internal/paths"
 	"github.com/autobrr/upbrr/internal/pathutil"
 	"github.com/autobrr/upbrr/internal/services/db"
@@ -65,7 +66,7 @@ func upload(ctx context.Context, req trackers.UploadRequest) (api.UploadSummary,
 		if artifactErr != nil && req.Logger != nil {
 			req.Logger.Warnf("trackers: BHDTV failure artifact write failed: %v", artifactErr)
 		}
-		message := firstNonEmpty(commonhttp.ExtractHTTPErrorDetail(responseBody), commonhttp.RedactErrorDetail(response.Message), commonhttp.RedactErrorDetail(response.Status), "upload response did not include a view URL")
+		message := metautil.FirstNonEmptyTrimmed(commonhttp.ExtractHTTPErrorDetail(responseBody), commonhttp.RedactErrorDetail(response.Message), commonhttp.RedactErrorDetail(response.Status), "upload response did not include a view URL")
 		if artifactPath != "" {
 			message += " (" + artifactPath + ")"
 		}
@@ -242,7 +243,7 @@ func resolveMediaDump(meta api.PreparedMetadata) (string, error) {
 		return text, nil
 	}
 
-	text := firstNonEmpty(strings.TrimSpace(meta.MediaInfoTextPath), strings.TrimSpace(meta.DVDVOBMediaInfoText))
+	text := metautil.FirstNonEmptyTrimmed(strings.TrimSpace(meta.MediaInfoTextPath), strings.TrimSpace(meta.DVDVOBMediaInfoText))
 	if strings.EqualFold(text, strings.TrimSpace(meta.MediaInfoTextPath)) {
 		payload, err := os.ReadFile(strings.TrimSpace(meta.MediaInfoTextPath))
 		if err != nil {
@@ -268,7 +269,7 @@ func resolveInlineDescription(meta api.PreparedMetadata) string {
 }
 
 func resolveUploadName(meta api.PreparedMetadata) string {
-	name := firstNonEmpty(
+	name := metautil.FirstNonEmptyTrimmed(
 		strings.TrimSpace(meta.ReleaseName),
 		strings.TrimSpace(meta.ReleaseNameNoTag),
 		strings.TrimSpace(meta.Filename),
@@ -311,7 +312,7 @@ func resolveMovieSubcategory(meta api.PreparedMetadata) string {
 		return "2"
 	case "REMUX":
 		switch {
-		case strings.Contains(strings.ToUpper(firstNonEmpty(meta.ReleaseName, meta.ReleaseNameNoTag)), "265"):
+		case strings.Contains(strings.ToUpper(metautil.FirstNonEmptyTrimmed(meta.ReleaseName, meta.ReleaseNameNoTag)), "265"):
 			return "48"
 		case meta.Is3D != "":
 			return "45"
@@ -322,7 +323,7 @@ func resolveMovieSubcategory(meta api.PreparedMetadata) string {
 		return "6"
 	case "ENCODE":
 		switch {
-		case strings.Contains(strings.ToUpper(firstNonEmpty(meta.ReleaseName, meta.ReleaseNameNoTag)), "265"):
+		case strings.Contains(strings.ToUpper(metautil.FirstNonEmptyTrimmed(meta.ReleaseName, meta.ReleaseNameNoTag)), "265"):
 			return "43"
 		case meta.Is3D != "":
 			return "44"
@@ -373,7 +374,7 @@ func resolveTVPackSubcategory(typeValue string) string {
 }
 
 func resolveResolutionID(meta api.PreparedMetadata) string {
-	switch normalizeResolution(firstNonEmpty(meta.Release.Resolution, meta.ReleaseName, meta.Filename)) {
+	switch normalizeResolution(metautil.FirstNonEmptyTrimmed(meta.Release.Resolution, meta.ReleaseName, meta.Filename)) {
 	case "2160P":
 		return "4"
 	case "1080P":
@@ -415,8 +416,8 @@ func buildDescription(assets trackers.DescriptionAssets) string {
 		parts = append(parts, base)
 	}
 	for _, image := range assets.Screenshots {
-		webURL := strings.TrimSpace(firstNonEmpty(image.WebURL, image.RawURL))
-		imgURL := strings.TrimSpace(firstNonEmpty(image.RawURL, image.ImgURL, image.WebURL))
+		webURL := strings.TrimSpace(metautil.FirstNonEmptyTrimmed(image.WebURL, image.RawURL))
+		imgURL := strings.TrimSpace(metautil.FirstNonEmptyTrimmed(image.RawURL, image.ImgURL, image.WebURL))
 		if webURL == "" || imgURL == "" {
 			continue
 		}
@@ -483,15 +484,6 @@ func normalizeResolution(value string) string {
 		}
 	}
 	return upper
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
 }
 
 func cloneFields(fields map[string]string) map[string]string {

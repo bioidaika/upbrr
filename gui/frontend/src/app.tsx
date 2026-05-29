@@ -12,6 +12,7 @@ import HistoryPage from "./pages/history/index";
 import LoggingPage from "./pages/logging";
 import PlaylistSelectionPage from "./pages/playlist_selection";
 import ScreenshotsPage from "./pages/screenshots";
+import MenuImagesPage from "./pages/menu_images";
 import SettingsPage from "./pages/settings";
 import TrackerDataPage from "./pages/tracker_data";
 import TrackerUploadPage from "./pages/tracker_upload";
@@ -239,6 +240,8 @@ declare global {
           App?: {
             BrowsePath: () => Promise<string>;
             BrowseFile: () => Promise<string>;
+            BrowseFiles: () => Promise<string[]>;
+            BrowseImageFiles: () => Promise<string[]>;
             BrowseFolder: () => Promise<string>;
             BrowseDirectory: (
               path: string,
@@ -330,6 +333,12 @@ declare global {
               overrides: ExternalIDOverrides,
               nameOverrides: ReleaseNameOverrides,
               images: ScreenshotImage[],
+            ) => Promise<void>;
+            ImportMenuImages: (
+              path: string,
+              overrides: ExternalIDOverrides,
+              nameOverrides: ReleaseNameOverrides,
+              paths: string[],
             ) => Promise<void>;
             ReadScreenshotImage: (path: string) => Promise<string>;
             ListUploadCandidates: (
@@ -530,6 +539,7 @@ export default function App() {
   const browserMode = isBrowserMode();
   const browserNativeBrowseAvailable = !browserMode || isBrowserNativeBrowseAvailable();
   const [path, setPath] = useState("");
+  const [currentDiscType, setCurrentDiscType] = useState("");
   const [sourceLookupURL, setSourceLookupURL] = useState("");
   const [loading, setLoading] = useState(false);
   const [metadataResetting, setMetadataResetting] = useState(false);
@@ -2448,6 +2458,8 @@ export default function App() {
   const handlePathSelected = async (selectedPath: string, mode: "file" | "folder" = "folder") => {
     freshUIStateCanPromoteRef.current = false;
     setPath(selectedPath);
+    const discType = await detectDiscType(selectedPath);
+    setCurrentDiscType(discType);
     setShowExternalIDInputUI(true);
     setPlaylistPreparationError("");
     setBdinfoProgressLines([]);
@@ -2460,7 +2472,6 @@ export default function App() {
       return;
     }
 
-    const discType = await detectDiscType(selectedPath);
     if (discType !== "BDMV") {
       setShowPlaylistSelection(false);
       setPlaylistSelectionPath("");
@@ -4025,6 +4036,15 @@ export default function App() {
                 Screenshots
               </button>
             ) : null}
+            {dupeChecked && ["BDMV", "DVD", "HDDVD"].includes(currentDiscType) ? (
+              <button
+                className={`subtab-button ${activeTab === "menu_images" ? "active" : ""}`}
+                type="button"
+                onClick={() => setActiveTab("menu_images")}
+              >
+                Menu Images
+              </button>
+            ) : null}
             {dupeChecked ? (
               <button
                 className={navButtonClass(activeTab === "upload_images", true)}
@@ -4236,6 +4256,16 @@ export default function App() {
               reorderFinalSelections={screenshots.reorderFinalSelections}
               finalResult={screenshots.finalResult}
               handleDeleteAllFinalImages={screenshots.handleDeleteAllFinalImages}
+            />
+          ) : activeTab === "menu_images" ? (
+            <MenuImagesPage
+              path={path}
+              overrides={idOverrideState?.overrides || {}}
+              nameOverrides={releaseOverrideState?.overrides || {}}
+              browseAvailable={browserNativeBrowseAvailable}
+              onImportComplete={() => {
+                setActiveTab("upload_images");
+              }}
             />
           ) : activeTab === "upload_images" ? (
             <UploadImagesPage

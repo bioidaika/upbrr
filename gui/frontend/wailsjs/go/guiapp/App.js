@@ -10,8 +10,16 @@ export function BrowseFile() {
   return window['go']['guiapp']['App']['BrowseFile']();
 }
 
+export function BrowseFiles() {
+  return window['go']['guiapp']['App']['BrowseFiles']();
+}
+
 export function BrowseFolder() {
   return window['go']['guiapp']['App']['BrowseFolder']();
+}
+
+export function BrowseImageFiles() {
+  return window['go']['guiapp']['App']['BrowseImageFiles']();
 }
 
 export function BrowsePath() {
@@ -132,6 +140,10 @@ export function GetWebAuthStatus() {
 
 export function ImportConfig() {
   return window['go']['guiapp']['App']['ImportConfig']();
+}
+
+export function ImportMenuImages(arg1, arg2, arg3, arg4) {
+  return window['go']['guiapp']['App']['ImportMenuImages'](arg1, arg2, arg3, arg4);
 }
 
 export function ListHistory() {

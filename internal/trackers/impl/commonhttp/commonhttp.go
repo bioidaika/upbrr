@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/autobrr/upbrr/internal/metadata/metautil"
 	"github.com/autobrr/upbrr/internal/paths"
 	"github.com/autobrr/upbrr/internal/redaction"
 	"github.com/autobrr/upbrr/internal/services/db"
@@ -165,7 +166,7 @@ func LoadNetscapeCookies(path string, expectedDomain string) ([]*http.Cookie, er
 		}
 		cookies = append(cookies, &http.Cookie{
 			Domain: "." + domain,
-			Path:   firstNonEmpty(strings.TrimSpace(fields[2]), "/"),
+			Path:   metautil.FirstNonEmptyTrimmed(strings.TrimSpace(fields[2]), "/"),
 			Secure: strings.EqualFold(strings.TrimSpace(fields[3]), "TRUE"),
 			Name:   name,
 			Value:  value,
@@ -227,7 +228,7 @@ func BuildMultipartPayload(fields map[string]string, files []FileField) ([]byte,
 		if strings.TrimSpace(file.FieldName) == "" {
 			continue
 		}
-		name := firstNonEmpty(strings.TrimSpace(file.FileName), filepath.Base(strings.TrimSpace(file.Path)), "upload.bin")
+		name := metautil.FirstNonEmptyTrimmed(strings.TrimSpace(file.FileName), filepath.Base(strings.TrimSpace(file.Path)), "upload.bin")
 		part, err := writer.CreateFormFile(file.FieldName, name)
 		if err != nil {
 			_ = writer.Close()
@@ -272,7 +273,7 @@ func BuildMultipartPayloadMulti(fields map[string][]string, files []FileField) (
 		if strings.TrimSpace(file.FieldName) == "" {
 			continue
 		}
-		name := firstNonEmpty(strings.TrimSpace(file.FileName), filepath.Base(strings.TrimSpace(file.Path)), "upload.bin")
+		name := metautil.FirstNonEmptyTrimmed(strings.TrimSpace(file.FileName), filepath.Base(strings.TrimSpace(file.Path)), "upload.bin")
 		part, err := writer.CreateFormFile(file.FieldName, name)
 		if err != nil {
 			_ = writer.Close()
@@ -533,13 +534,4 @@ func compactHTTPErrorText(text string) string {
 		return text
 	}
 	return strings.TrimSpace(text[:maxHTTPErrorDetailLength]) + "..."
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
 }

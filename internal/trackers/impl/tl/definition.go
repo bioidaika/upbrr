@@ -28,6 +28,13 @@ func (definition) BuildDescription(ctx context.Context, req trackers.Description
 	if err != nil {
 		assets = trackers.DescriptionAssets{}
 	}
-	description := buildDescription(req.Meta, assets)
+	description := buildDescription(trackers.UploadRequest{
+		Tracker:       req.Tracker,
+		Meta:          req.Meta,
+		TrackerConfig: req.TrackerConfig,
+		AppConfig:     req.AppConfig,
+		Logger:        req.Logger,
+		Repo:          req.Repo,
+	}, assets)
 	return trackers.DescriptionResult{Group: "tl", Description: description}, nil
 }

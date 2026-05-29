@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/autobrr/upbrr/internal/metadata/metautil"
+
 	"github.com/autobrr/upbrr/pkg/api"
 )
 
@@ -443,7 +445,7 @@ func printDryRunDetails(entry api.TrackerDryRunEntry) {
 			if file.Present {
 				status = "present"
 			}
-			fmt.Printf("- %s [%s]: %s\n", file.Field, status, firstNonEmpty(strings.TrimSpace(file.Path), "(none)"))
+			fmt.Printf("- %s [%s]: %s\n", file.Field, status, metautil.FirstNonEmptyTrimmed(strings.TrimSpace(file.Path), "(none)"))
 		}
 	}
 	if len(entry.Payload) > 0 {
@@ -460,15 +462,6 @@ func printDryRunDetails(entry api.TrackerDryRunEntry) {
 	if message := strings.TrimSpace(entry.Description); message != "" {
 		fmt.Printf("Description:\n%s\n", message)
 	}
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
 }
 
 func promptYesNo(reader *bufio.Reader, prompt string, defaultYes bool) (bool, error) {

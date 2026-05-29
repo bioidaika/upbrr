@@ -192,7 +192,7 @@ func TestResolveReleaseGroupBansUpdatedGroups(t *testing.T) {
 }
 
 func TestBuildDescriptionRemovesScreenshotOnlyBlockAndDefaultSignature(t *testing.T) {
-	description := buildDescription(api.PreparedMetadata{}, trackers.DescriptionAssets{
+	description := buildDescription(trackers.UploadRequest{}, trackers.DescriptionAssets{
 		Description: `[align=center]
 [url=https://ptpimg.me/fv71hr.png][img width=350]https://ptpimg.me/fv71hr.png[/img][/url]
 [/align]

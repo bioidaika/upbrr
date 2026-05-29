@@ -18,10 +18,12 @@ import (
 	"strings"
 
 	"github.com/autobrr/upbrr/internal/httpclient"
+	"github.com/autobrr/upbrr/internal/metadata/metautil"
 	"github.com/autobrr/upbrr/internal/paths"
 	"github.com/autobrr/upbrr/internal/pathutil"
 	"github.com/autobrr/upbrr/internal/services/bbcode"
 	"github.com/autobrr/upbrr/internal/services/db"
+	"github.com/autobrr/upbrr/internal/services/description/unit3d"
 	"github.com/autobrr/upbrr/internal/trackers"
 	"github.com/autobrr/upbrr/internal/trackers/impl/commonhttp"
 	"github.com/autobrr/upbrr/pkg/api"
@@ -30,7 +32,7 @@ import (
 const antUploadURL = "https://anthelion.me/api.php"
 
 var antTorrentIDPattern = regexp.MustCompile(`id=(\d+)`)
-var antDefaultSignaturePattern = regexp.MustCompile(`(?is)\[(?:right|align=right)\]\s*\[url=https://github\.com/Audionut/upbrr\].*?\[/url\]\s*\[/(?:right|align)\]`)
+var antDefaultSignaturePattern = regexp.MustCompile(`(?is)\[(?:right|align=right)\]\s*\[url=https://github\.com/(?:Audionut|autobrr)/upbrr\].*?\[/url\]\s*\[/(?:right|align)\]`)
 var antEmptyURLPattern = regexp.MustCompile(`(?is)\[url=[^\]]*]\s*\[/url\]`)
 
 var antBannedReleaseGroups = map[string]struct{}{
@@ -170,7 +172,7 @@ func prepareUploadState(ctx context.Context, req trackers.UploadRequest) (upload
 		trackers.LogDescriptionAssetResolutionFailure(req.Logger, req.Tracker, err)
 		descriptionAssets = trackers.DescriptionAssets{}
 	}
-	description := buildDescription(req.Meta, descriptionAssets)
+	description := buildDescription(req, descriptionAssets)
 
 	answers := questionnaireAnswers(req.Meta)
 	typeName, typeID := resolveType(req.Meta, answers)
@@ -232,24 +234,75 @@ func prepareUploadState(ctx context.Context, req trackers.UploadRequest) (upload
 	}, nil
 }
 
-func buildDescription(meta api.PreparedMetadata, assets trackers.DescriptionAssets) string {
+func buildDescription(req trackers.UploadRequest, assets trackers.DescriptionAssets) string {
+	meta := req.Meta
+	var parts []string
+
+	// Base description
 	base := strings.TrimSpace(antDefaultSignaturePattern.ReplaceAllString(assets.Description, ""))
-	if base == "" {
-		return ""
-	}
-
 	report := bbcode.CleanPTPDescription(base, meta.DiscType)
-	if len(report.Images) > 0 {
-		return ""
+	userDesc := strings.TrimSpace(report.Description)
+	if userDesc == "" && base != "" && len(report.Images) == 0 {
+		userDesc = base
 	}
 
-	body := strings.TrimSpace(report.Description)
-	if body == "" {
-		body = base
+	if userDesc != "" {
+		// Custom Header
+		if header := strings.TrimSpace(req.AppConfig.Description.CustomDescriptionHeader); header != "" {
+			parts = append(parts, header)
+		}
+
+		// Logo
+		logoURL, _ := unit3d.ResolveLogo(meta, req.AppConfig)
+		if logoURL != "" {
+			if strings.HasSuffix(logoURL, ".svg") {
+				logoURL = strings.ReplaceAll(logoURL, ".svg", ".png")
+			}
+			parts = append(parts, "[align=center][img]"+logoURL+"[/img][/align]")
+		}
+
+		// User Description
+		parts = append(parts, userDesc)
 	}
 
-	finalized := bbcode.FinalizeTrackerDescription("ANT", body)
+	// Disc menus
+	if len(assets.MenuImages) > 0 {
+		if header := strings.TrimSpace(req.AppConfig.Description.DiscMenuHeader); header != "" {
+			parts = append(parts, header)
+		}
+		var shotParts []string
+		for _, img := range assets.MenuImages {
+			url := metautil.FirstNonEmptyTrimmed(img.RawURL, img.ImgURL, img.WebURL)
+			if url != "" {
+				shotParts = append(shotParts, "[img]"+url+"[/img]")
+			}
+		}
+		if len(shotParts) > 0 {
+			parts = append(parts, "[align=center]"+strings.Join(shotParts, " ")+"[/align]")
+		}
+	}
+
+	// Tonemapped Header
+	if tonemapHeader := strings.TrimSpace(req.AppConfig.Description.TonemappedHeader); tonemapHeader != "" && unit3d.ShouldIncludeTonemappedHeader(meta, req.AppConfig, assets.Screenshots) {
+		parts = append(parts, tonemapHeader)
+	}
+
+	// Join and finalize
+	description := strings.Join(parts, "\n\n")
+
+	finalized := bbcode.FinalizeTrackerDescription("ANT", description)
+
+	// Character replacements
+	replacer := strings.NewReplacer("•", "-", "’", "'", "–", "-")
+	finalized = replacer.Replace(finalized)
+
 	finalized = strings.TrimSpace(antEmptyURLPattern.ReplaceAllString(finalized, ""))
+
+	// Debug saving
+	if meta.Options.Debug {
+		unit3d.SaveDescriptionDebug(meta, "ANT", req.AppConfig.MainSettings.DBPath, finalized, req.Logger)
+	}
+
 	return finalized
 }
 
@@ -332,7 +385,7 @@ func buildQuestionnaire(meta api.PreparedMetadata, state uploadState) *api.Track
 			Label:       "Upload Screenshots",
 			Kind:        "select",
 			Options:     []string{"no", "yes"},
-			Value:       firstNonEmpty(strings.TrimSpace(current["adult_screens"]), "no"),
+			Value:       metautil.FirstNonEmptyTrimmed(strings.TrimSpace(current["adult_screens"]), "no"),
 			Placeholder: "Select yes or no",
 			Help:        "Set to yes to include screenshots for adult content",
 			Required:    true,
@@ -732,13 +785,4 @@ func dedupeStrings(values []string) []string {
 		result = append(result, trimmed)
 	}
 	return result
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
 }
