@@ -298,6 +298,11 @@ func (s *Service) injectQbit(ctx context.Context, name string, client config.Tor
 			s.logger.Debugf("clients: qbit path mapping ready client=%s save_path=%s", name, savePath)
 		}
 	}
+
+	if options.SavePath != "" {
+		f := false
+		options.AutoTMM = &f
+	}
 	if category := strings.TrimSpace(client.QbitCrossCategory); torrent.CrossSeed && category != "" {
 		options.Category = category
 	} else if category := strings.TrimSpace(client.QbitCategory()); category != "" {
