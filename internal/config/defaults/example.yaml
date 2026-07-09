@@ -512,6 +512,11 @@ trackers:
     api_key: ""
     url: "https://utp.to"
     anon: false
+  VMF:
+    link_dir_name: ""
+    api_key: ""
+    url: "https://vietmediaf.net"
+    anon: false
   YUS:
     link_dir_name: ""
     api_key: ""
