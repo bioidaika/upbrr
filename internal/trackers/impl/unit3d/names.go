@@ -20,8 +20,8 @@ import (
 )
 
 var noGroupTagPattern = regexp.MustCompile(`(?i)-(nogrp|nogroup|unknown|-unk-)`)
-var vmfDubPattern = regexp.MustCompile(`(?i)(lồng tiếng|long tieng|\b(?:us|vn)?lt\b)`)
-var vmfViePattern = regexp.MustCompile(`(?i)(thuyết minh|thuyet minh|\b(?:vtv|htv|sctv|thvl)?tm\b)`)
+var vmfDubPattern = regexp.MustCompile(`(?i)(lồng tiếng|long tieng|\b(?:us|vn)lt\b)`)
+var vmfViePattern = regexp.MustCompile(`(?i)(thuyết minh|thuyet minh|\btm\b)`)
 var (
 	languageTagLookupOnce sync.Once
 	languageTagLookup     map[string]language.Tag
@@ -123,24 +123,14 @@ func buildVMFName(name string, meta api.PreparedMetadata) string {
 
 	words := strings.Fields(name)
 	insertIdx := -1
+	parsedRes := strings.ToLower(meta.Release.Resolution)
 
 	// Attempt to find resolution to insert before
 	for i, w := range words {
 		lowerW := strings.ToLower(w)
-		if lowerW == "2160p" || lowerW == "1080p" || lowerW == "720p" || lowerW == "1080i" || lowerW == "4k" {
+		if parsedRes != "" && lowerW == parsedRes {
 			insertIdx = i
 			break
-		}
-	}
-
-	// Fallback to source
-	if insertIdx == -1 {
-		for i, w := range words {
-			lowerW := strings.ToLower(w)
-			if strings.Contains(lowerW, "bluray") || strings.Contains(lowerW, "web") || strings.Contains(lowerW, "hdtv") || strings.Contains(lowerW, "dvd") {
-				insertIdx = i
-				break
-			}
 		}
 	}
 
