@@ -48,16 +48,20 @@ const (
 	MaxDVDMenuItems = 32
 )
 
+// MainSettingsConfig defines application-wide runtime and presentation settings.
+// TMDB enrichment is disabled when TMDBAPI is empty; other metadata providers
+// and externally supplied metadata IDs remain available.
 type MainSettingsConfig struct {
-	UpdateNotification  bool   `yaml:"update_notification"`
-	VerboseNotification bool   `yaml:"verbose_notification"`
-	TMDBAPI             string `yaml:"tmdb_api"`
-	TrackerPassChecks   int    `yaml:"tracker_pass_checks"`
-	InputHistoryLimit   int    `yaml:"input_history_limit"`
-	DBPath              string `yaml:"db_path"`
-	UseFavicons         bool   `yaml:"use_favicons"`
-	FaviconOnly         bool   `yaml:"favicon_only"`
-	SceneDetection      bool   `yaml:"scene_detection"`
+	UpdateNotification  bool `yaml:"update_notification"`
+	VerboseNotification bool `yaml:"verbose_notification"`
+	// TMDBAPI is the optional API key used for TMDB lookups and enrichment.
+	TMDBAPI           string `yaml:"tmdb_api"`
+	TrackerPassChecks int    `yaml:"tracker_pass_checks"`
+	InputHistoryLimit int    `yaml:"input_history_limit"`
+	DBPath            string `yaml:"db_path"`
+	UseFavicons       bool   `yaml:"use_favicons"`
+	FaviconOnly       bool   `yaml:"favicon_only"`
+	SceneDetection    bool   `yaml:"scene_detection"`
 }
 
 type mainSettingsConfigAlias MainSettingsConfig
@@ -746,6 +750,9 @@ type TorrentClientConfig struct {
 	LinkedFolder  StringList `yaml:"linked_folder"`
 	LocalPath     StringList `yaml:"local_path"`
 	RemotePath    StringList `yaml:"remote_path"`
+	// AutomaticManagementPaths enables qBittorrent automatic management when
+	// an unlinked injection's original local save path contains any configured value.
+	AutomaticManagementPaths StringList `yaml:"automatic_management_paths"`
 
 	QbitURL                string   `yaml:"qbit_url"`
 	QbitPort               int      `yaml:"qbit_port"`
@@ -815,6 +822,7 @@ func torrentClientConfigJSONMap(c TorrentClientConfig) map[string]any {
 	addStringList("LinkedFolder", c.LinkedFolder)
 	addStringList("LocalPath", c.LocalPath)
 	addStringList("RemotePath", c.RemotePath)
+	addStringList("AutomaticManagementPaths", c.AutomaticManagementPaths)
 	if c.VerifyWebUICertificate != nil {
 		out["VerifyWebUICertificate"] = *c.VerifyWebUICertificate
 	}
@@ -864,6 +872,7 @@ func torrentClientConfigYAMLMap(c TorrentClientConfig) map[string]any {
 	addStringList("linked_folder", c.LinkedFolder)
 	addStringList("local_path", c.LocalPath)
 	addStringList("remote_path", c.RemotePath)
+	addStringList("automatic_management_paths", c.AutomaticManagementPaths)
 	if c.VerifyWebUICertificate != nil {
 		out["verify_webui_certificate"] = *c.VerifyWebUICertificate
 	}
@@ -872,11 +881,9 @@ func torrentClientConfigYAMLMap(c TorrentClientConfig) map[string]any {
 }
 
 // Validate checks the loaded configuration values needed before runtime
-// services can safely start or save settings.
+// services can safely start or save settings. An empty TMDBAPI is valid and
+// leaves TMDB enrichment disabled.
 func (c Config) Validate() error {
-	if c.MainSettings.TMDBAPI == "" {
-		return errors.New("config: main_settings.tmdb_api is required")
-	}
 	if c.MainSettings.InputHistoryLimit < 0 {
 		return errors.New("config: main_settings.input_history_limit must be zero or greater")
 	}

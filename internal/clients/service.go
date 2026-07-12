@@ -4,18 +4,23 @@
 package clients
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/autobrr/upbrr/internal/config"
 	internalerrors "github.com/autobrr/upbrr/internal/errors"
+	"github.com/autobrr/upbrr/internal/pathutil"
 	"github.com/autobrr/upbrr/internal/redaction"
 	"github.com/autobrr/upbrr/pkg/api"
 
@@ -32,7 +37,43 @@ type Service struct {
 const (
 	qbitInjectHTTPTimeout       = 30 * time.Second
 	qbitInjectHTTPRetryAttempts = 1
+	qbitLoginResponseMaxBytes   = 4 << 10
 )
+
+// qbitLoginValidatingTransport verifies direct qBittorrent login responses
+// before net/http can persist response cookies in the client's jar.
+type qbitLoginValidatingTransport struct {
+	base http.RoundTripper
+}
+
+// RoundTrip requires the exact qBittorrent success body for HTTP 200 login
+// responses. It bounds the body read and restores valid bodies for LoginCtx.
+func (t qbitLoginValidatingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return nil, fmt.Errorf("qbit HTTP request: %w", err)
+	}
+	if !strings.HasSuffix(req.URL.Path, "/api/v2/auth/login") || resp.StatusCode != http.StatusOK {
+		return resp, nil
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, qbitLoginResponseMaxBytes+1))
+	if err != nil {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("read qbit login response: %w", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		return nil, fmt.Errorf("close qbit login response: %w", err)
+	}
+	if len(body) > qbitLoginResponseMaxBytes {
+		return nil, errors.New("qbit login response exceeds limit")
+	}
+	if string(body) != "Ok." {
+		return nil, errors.New("qbit login response was not successful")
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return resp, nil
+}
 
 func NewService(cfg config.Config, logger api.Logger) *Service {
 	if logger == nil {
@@ -274,18 +315,26 @@ func (s *Service) injectQbit(ctx context.Context, name string, client config.Tor
 	}
 
 	qbit := qbittorrent.NewClient(qbitInjectClientConfig(host, username, password, client))
+	qbitHTTP := qbit.GetHTTPClient()
+	baseTransport := qbitHTTP.Transport
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport
+	}
+	// The transport sees the response before http.Client stores Set-Cookie
+	// values, so a transient body cannot create an authenticated session.
+	qbitHTTP.Transport = qbitLoginValidatingTransport{base: baseTransport}
 
 	options := qbittorrent.TorrentAddOptions{}
-	options.SkipHashCheck = true
-	s.logger.Debugf("clients: preparing qbit add options for client %s", name)
+	s.logger.Debugf("clients: preparing qbit add options client=%s tracker=%s cross_seed=%t", name, strings.TrimSpace(torrent.Tracker), torrent.CrossSeed)
 	optionsStart := time.Now()
-	staging, err := s.prepareLinkStaging(ctx, name, client, meta, torrent.Tracker)
+	staging, err := s.prepareLinkStaging(ctx, name, client, meta, torrent)
 	if err != nil {
 		return err
 	}
+	options.SkipHashCheck = true
 	if staging.Linked {
 		options.SavePath = staging.SavePath
-		s.logger.Debugf("clients: qbit link staging ready client=%s tracker=%s save_path=%s", name, strings.TrimSpace(torrent.Tracker), staging.SavePath)
+		s.logger.Debugf("clients: qbit link staging selected client=%s tracker=%s files=%d layout_validated=%t save_path=%s", name, strings.TrimSpace(torrent.Tracker), staging.FileCount, staging.LayoutValidated, staging.SavePath)
 	} else {
 		// Without link staging, local_path/remote_path still controls where
 		// qBittorrent should save the injected torrent on the client host.
@@ -315,7 +364,10 @@ func (s *Service) injectQbit(ctx context.Context, name string, client config.Tor
 	} else if client.UseTrackerAsTag {
 		options.Tags = strings.TrimSpace(torrent.Tracker)
 	}
-	s.logger.Debugf("clients: qbit add options ready client=%s elapsed=%s", name, time.Since(optionsStart).Round(time.Millisecond))
+	autoManagement := !staging.Linked && qbitAutomaticManagementEnabled(meta, client.AutomaticManagementPaths)
+	addOptions := options.Prepare()
+	addOptions["autoTMM"] = strconv.FormatBool(autoManagement)
+	s.logger.Debugf("clients: qbit add options ready client=%s auto_tmm=%t skip_hash_check=%t elapsed=%s", name, autoManagement, options.SkipHashCheck, time.Since(optionsStart).Round(time.Millisecond))
 
 	qbitCtx, cancel := context.WithTimeout(ctx, qbitInjectHTTPTimeout)
 	defer cancel()
@@ -323,6 +375,7 @@ func (s *Service) injectQbit(ctx context.Context, name string, client config.Tor
 	s.logger.Debugf("clients: connecting to qbit %s timeout=%s retries=%d", redaction.RedactValue(host, nil), qbitInjectHTTPTimeout, qbitInjectHTTPRetryAttempts)
 	if !client.UsesQuiProxy() {
 		if err := qbit.LoginCtx(qbitCtx); err != nil {
+			s.cleanupFailedLinkStaging(name, torrent.Tracker, staging)
 			return fmt.Errorf("clients: %s qbit login: %w", name, err)
 		}
 		s.logger.Debugf("clients: connected to qbit client %s", name)
@@ -332,26 +385,54 @@ func (s *Service) injectQbit(ctx context.Context, name string, client config.Tor
 
 	if torrentPath := strings.TrimSpace(torrent.Path); torrentPath != "" {
 		s.logger.Debugf("clients: adding torrent file to qbit client %s for %s", name, meta.SourcePath)
-		if _, err := qbit.AddTorrentFromFileCtx(qbitCtx, torrentPath, options.Prepare()); err != nil {
+		if _, err := qbit.AddTorrentFromFileCtx(qbitCtx, torrentPath, addOptions); err != nil {
 			s.cleanupFailedLinkStaging(name, torrent.Tracker, staging)
 			return fmt.Errorf("clients: %s qbit add torrent file: %w", name, err)
 		}
 
-		s.logger.Infof("clients: added torrent file to qbit client=%s tracker=%s source=%s", name, logTracker(torrent.Tracker), meta.SourcePath)
+		s.logger.Infof("clients: added torrent file to qbit client=%s tracker=%s linked=%t qbit_hash_check=%t source=%s", name, logTracker(torrent.Tracker), staging.Linked, !options.SkipHashCheck, meta.SourcePath)
 		return nil
 	}
 
 	if torrentURL := strings.TrimSpace(torrent.URL); torrentURL != "" {
 		s.logger.Debugf("clients: adding tracker torrent URL to qbit client %s for %s", name, meta.SourcePath)
-		if _, err := qbit.AddTorrentFromUrlCtx(qbitCtx, torrentURL, options.Prepare()); err != nil {
+		if _, err := qbit.AddTorrentFromUrlCtx(qbitCtx, torrentURL, addOptions); err != nil {
 			s.cleanupFailedLinkStaging(name, torrent.Tracker, staging)
 			return fmt.Errorf("clients: %s qbit add torrent URL: %w", name, err)
 		}
-		s.logger.Infof("clients: added tracker torrent URL to qbit client=%s tracker=%s source=%s", name, logTracker(torrent.Tracker), meta.SourcePath)
+		s.logger.Infof("clients: added tracker torrent URL to qbit client=%s tracker=%s linked=%t qbit_hash_check=%t source=%s", name, logTracker(torrent.Tracker), staging.Linked, !options.SkipHashCheck, meta.SourcePath)
 		return nil
 	}
 
 	return internalerrors.ErrInvalidInput
+}
+
+// qbitAutomaticManagementEnabled reports whether the original local save path
+// is a configured automatic-management root or one of its descendants after
+// trimming and filepath cleaning. Containment uses host semantics: Windows
+// comparisons ignore case, while case-sensitive systems preserve it. Linked
+// staging is excluded by the caller.
+func qbitAutomaticManagementEnabled(meta api.PreparedMetadata, configuredPaths config.StringList) bool {
+	if len(configuredPaths) == 0 {
+		return false
+	}
+
+	source, err := sourcePathForQbitSavePath(meta)
+	if err != nil {
+		return false
+	}
+	localSavePath := filepath.Clean(filepath.Dir(source))
+	for _, configuredPath := range configuredPaths {
+		configuredPath = strings.TrimSpace(configuredPath)
+		if configuredPath == "" {
+			continue
+		}
+		configuredPath = filepath.Clean(configuredPath)
+		if pathutil.IsWithinRoot(configuredPath, localSavePath) {
+			return true
+		}
+	}
+	return false
 }
 
 func logTracker(tracker string) string {
@@ -380,10 +461,10 @@ func (s *Service) cleanupFailedLinkStaging(clientName string, tracker string, st
 		return
 	}
 	if err := staging.Cleanup.Run(); err != nil {
-		s.logger.Warnf("clients: %s cleanup failed after qbit add error tracker=%s: %v", clientName, strings.TrimSpace(tracker), err)
+		s.logger.Warnf("clients: %s cleanup failed after qbit injection error tracker=%s: %v", clientName, strings.TrimSpace(tracker), err)
 		return
 	}
-	s.logger.Debugf("clients: %s cleaned staged links after qbit add error tracker=%s", clientName, strings.TrimSpace(tracker))
+	s.logger.Debugf("clients: %s cleaned staged links after qbit injection error tracker=%s", clientName, strings.TrimSpace(tracker))
 }
 
 // resolveInjectClients selects the configured torrent clients that should receive
