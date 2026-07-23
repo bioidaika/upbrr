@@ -12,8 +12,10 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -41,9 +43,8 @@ var htmlTagPattern = regexp.MustCompile(`<[^>]+>`)
 
 // FileField describes one file part in a tracker multipart upload. FieldName is
 // the form field; Content is used when present; otherwise Path is read from disk
-// and FileName overrides the filename sent in the part. ContentType is carried
-// for callers that need to retain media-type metadata, but the current builders
-// use Go's default multipart file-part headers.
+// and FileName overrides the filename sent in the part. A non-empty ContentType
+// overrides Go's default application/octet-stream file-part media type.
 type FileField struct {
 	FieldName   string
 	FileName    string
@@ -245,7 +246,7 @@ func BuildMultipartPayload(fields map[string]string, files []FileField) ([]byte,
 			continue
 		}
 		name := metautil.FirstNonEmptyTrimmed(strings.TrimSpace(file.FileName), filepath.Base(strings.TrimSpace(file.Path)), "upload.bin")
-		part, err := writer.CreateFormFile(file.FieldName, name)
+		part, err := createMultipartFilePart(writer, file.FieldName, name, file.ContentType)
 		if err != nil {
 			_ = writer.Close()
 			return nil, "", fmt.Errorf("create multipart file %q: %w", file.FieldName, err)
@@ -293,7 +294,7 @@ func BuildMultipartPayloadMulti(fields map[string][]string, files []FileField) (
 			continue
 		}
 		name := metautil.FirstNonEmptyTrimmed(strings.TrimSpace(file.FileName), filepath.Base(strings.TrimSpace(file.Path)), "upload.bin")
-		part, err := writer.CreateFormFile(file.FieldName, name)
+		part, err := createMultipartFilePart(writer, file.FieldName, name, file.ContentType)
 		if err != nil {
 			_ = writer.Close()
 			return nil, "", fmt.Errorf("create multipart file %q: %w", file.FieldName, err)
@@ -315,6 +316,41 @@ func BuildMultipartPayloadMulti(fields map[string][]string, files []FileField) (
 		return nil, "", fmt.Errorf("close multipart writer: %w", err)
 	}
 	return body.Bytes(), writer.FormDataContentType(), nil
+}
+
+func createMultipartFilePart(writer *multipart.Writer, fieldName string, fileName string, contentType string) (io.Writer, error) {
+	escapedFieldName, err := escapeMultipartDispositionValue(fieldName)
+	if err != nil {
+		return nil, fmt.Errorf("invalid multipart field name: %w", err)
+	}
+	escapedFileName, err := escapeMultipartDispositionValue(fileName)
+	if err != nil {
+		return nil, fmt.Errorf("invalid multipart file name: %w", err)
+	}
+
+	mediaType := "application/octet-stream"
+	if trimmed := strings.TrimSpace(contentType); trimmed != "" {
+		parsedType, params, err := mime.ParseMediaType(trimmed)
+		if err != nil {
+			return nil, fmt.Errorf("invalid multipart content type: %w", err)
+		}
+		mediaType = mime.FormatMediaType(parsedType, params)
+		if mediaType == "" {
+			return nil, errors.New("invalid multipart content type")
+		}
+	}
+
+	return writer.CreatePart(textproto.MIMEHeader{
+		"Content-Disposition": {fmt.Sprintf(`form-data; name="%s"; filename="%s"`, escapedFieldName, escapedFileName)},
+		"Content-Type":        {mediaType},
+	})
+}
+
+func escapeMultipartDispositionValue(value string) (string, error) {
+	if strings.ContainsAny(value, "\r\n") {
+		return "", errors.New("multipart disposition value contains a newline")
+	}
+	return strings.NewReplacer("\\", "\\\\", `"`, `\"`).Replace(value), nil
 }
 
 // ApplyCookies adds non-empty cookies to req and ignores nil cookies or blank

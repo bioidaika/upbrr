@@ -770,6 +770,29 @@ func TestLoadEmbeddedDefaultConfig(t *testing.T) {
 	if _, ok := cfg.Trackers.Trackers["BTN"]; !ok {
 		t.Fatalf("embedded default trackers should include BTN")
 	}
+	nethd, ok := cfg.Trackers.Trackers["NETHD"]
+	if !ok {
+		t.Fatal("embedded default trackers should include NETHD")
+	}
+	if nethd.LinkDirName != "" {
+		t.Fatalf("NETHD default link directory: got %q want empty", nethd.LinkDirName)
+	}
+	if nethd.URL != "https://nethd.org" {
+		t.Fatalf("NETHD default URL: got %q want %q", nethd.URL, "https://nethd.org")
+	}
+	if nethd.AnnounceURL != "" {
+		t.Fatalf("NETHD default announce URL: got %q want empty", nethd.AnnounceURL)
+	}
+	if nethd.FullMediainfo {
+		t.Fatal("NETHD full mediainfo should be disabled by default")
+	}
+
+	allowedKeys := trackerAllowedYAMLKeys("NETHD")
+	for _, key := range []string{"link_dir_name", "url", "announce_url", "full_mediainfo"} {
+		if _, ok := allowedKeys[key]; !ok {
+			t.Fatalf("NETHD tracker schema should include %q", key)
+		}
+	}
 }
 
 func TestMergeMissingTrackerDefaults(t *testing.T) {

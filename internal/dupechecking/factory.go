@@ -27,6 +27,7 @@ func buildHandlers(deps handlerDeps) map[string]searchHandler {
 	handlers["GPW"] = gpwHandler{cfg: deps.cfg, http: deps.http}
 	handlers["MTV"] = mtvHandler{cfg: deps.cfg, http: deps.http}
 	handlers["NBL"] = nblHandler{cfg: deps.cfg, http: deps.http}
+	handlers["NETHD"] = nethdHandler{cfg: deps.cfg, http: deps.http}
 	handlers["AR"] = arHandler{cfg: deps.cfg, http: deps.http, logger: deps.logger}
 	handlers["RTF"] = rtfHandler{cfg: deps.cfg, http: deps.http, logger: deps.logger}
 	handlers["SPD"] = spdHandler{cfg: deps.cfg, http: deps.http}

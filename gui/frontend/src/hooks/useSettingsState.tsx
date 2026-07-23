@@ -484,6 +484,13 @@ const trackerSchemas: Record<string, FieldMeta[]> = {
     trackerFieldMeta.APIKey,
     trackerFieldMeta.AnnounceURL,
   ],
+  NETHD: [
+    trackerFieldMeta.FaviconURL,
+    trackerFieldMeta.LinkDirName,
+    trackerFieldMeta.URL,
+    trackerFieldMeta.AnnounceURL,
+    trackerFieldMeta.FullMediainfo,
+  ],
   OE: [
     trackerFieldMeta.FaviconURL,
     trackerFieldMeta.LinkDirName,

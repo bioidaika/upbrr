@@ -829,6 +829,51 @@ describe("Tracker client selectors", () => {
     expect(screen.getByLabelText("Announce URL")).toHaveValue("");
   });
 
+  it("renders the NETHD tracker fields from its schema", async () => {
+    (globalThis as typeof globalThis & { go?: any }).go = {
+      guiapp: {
+        App: {
+          GetConfig: async () =>
+            JSON.stringify({
+              Trackers: {
+                DefaultTrackers: [],
+                PreferredTracker: "",
+                Trackers: {
+                  NETHD: {
+                    FaviconURL: "https://nethd.org/favicon.ico",
+                    LinkDirName: "nethd",
+                    URL: "https://nethd.org",
+                    AnnounceURL: "https://nethd.org/announce.php?passkey=redacted",
+                    FullMediainfo: true,
+                  },
+                },
+              },
+            }),
+          GetDefaultConfig: async () => JSON.stringify({}),
+          ListKnownTrackers: async () => ["NETHD"],
+          GetImageHostPolicyMetadata: async () => ({}),
+        },
+      },
+    };
+
+    render(createElement(TrackerSettingsAdvancedHarness));
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("NETHD", { selector: ".settings-card__summary-name" }),
+      ).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByText("NETHD", { selector: ".settings-card__summary-name" }));
+
+    expect(screen.getByLabelText("Favicon URL")).toHaveValue("https://nethd.org/favicon.ico");
+    expect(screen.getByLabelText("Link dir name")).toHaveValue("nethd");
+    expect(screen.getByLabelText("URL")).toHaveValue("https://nethd.org");
+    expect(screen.getByLabelText("Announce URL")).toHaveValue(
+      "https://nethd.org/announce.php?passkey=redacted",
+    );
+    expect(screen.getByLabelText("Full mediainfo")).toBeChecked();
+  });
+
   it("shows Lostimg as an LST image host only when configured in image hosting", async () => {
     (globalThis as typeof globalThis & { go?: any }).go = {
       guiapp: {

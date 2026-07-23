@@ -64,6 +64,9 @@ func TestNewRegistryIncludesHDB(t *testing.T) {
 	if _, ok := registry.Lookup("NBL"); !ok {
 		t.Fatal("expected NBL definition to be registered")
 	}
+	if _, ok := registry.Lookup("NETHD"); !ok {
+		t.Fatal("expected NETHD definition to be registered")
+	}
 	if _, ok := registry.Lookup("PTS"); !ok {
 		t.Fatal("expected PTS definition to be registered")
 	}

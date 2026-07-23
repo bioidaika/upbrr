@@ -25,20 +25,27 @@ import (
 )
 
 const (
-	arDefaultBaseURL  = "https://alpharatio.cc"
-	authPreviewBytes  = 64 * 1024
-	authResponseBytes = 1 * 1024 * 1024
-	arIndexPath       = "/index.php"
-	arLoginPath       = "/login.php"
-	ffDefaultBaseURL  = "https://www.funfile.org"
-	ffLoginPath       = "/takelogin.php"
-	ffUploadPath      = "/upload.php"
-	flDefaultBaseURL  = "https://filelist.io"
-	flIndexPath       = "/index.php"
-	flLoginPagePath   = "/login.php"
-	flLoginPath       = "/takelogin.php"
-	hdbDefaultBaseURL = "https://hdbits.org"
-	hdbUploadPath     = "/upload/upload"
+	arDefaultBaseURL    = "https://alpharatio.cc"
+	authPreviewBytes    = 64 * 1024
+	authResponseBytes   = 1 * 1024 * 1024
+	arIndexPath         = "/index.php"
+	arLoginPath         = "/login.php"
+	ffDefaultBaseURL    = "https://www.funfile.org"
+	ffLoginPath         = "/takelogin.php"
+	ffUploadPath        = "/upload.php"
+	flDefaultBaseURL    = "https://filelist.io"
+	flIndexPath         = "/index.php"
+	flLoginPagePath     = "/login.php"
+	flLoginPath         = "/takelogin.php"
+	hdbDefaultBaseURL   = "https://hdbits.org"
+	hdbUploadPath       = "/upload/upload"
+	nethdDefaultBaseURL = "https://nethd.org"
+	nethdUploadPath     = "/upload.php"
+
+	nethdAnnounceMissingMessage     = "announce_url with a passkey query parameter is required in addition to imported cookies"
+	nethdAnnounceInvalidMessage     = "announce_url must be a valid HTTP(S) URL with a passkey query parameter"
+	nethdAnnouncePasskeyMessage     = "announce_url must contain a non-empty passkey query parameter"
+	nethdAnnouncePlaceholderMessage = "announce_url must replace the placeholder passkey with a personal passkey"
 )
 
 // flValidatorPattern extracts the anti-CSRF validator required by FL login.
@@ -385,6 +392,106 @@ func resolveHDBStoredSessionForTrackerAuth(ctx context.Context, cfg config.Track
 	return nil
 }
 
+// resolveNETHDStoredSessionForTrackerAuth verifies the two independent NETHD
+// upload prerequisites: a personal announce URL and imported browser cookies.
+// Cookie loading merges encrypted storage with legacy Netscape/JSON files.
+func resolveNETHDStoredSessionForTrackerAuth(ctx context.Context, cfg config.TrackerConfig, dbPath string, _ api.TrackerAuthLoginRequest) error {
+	if blocker := nethdAnnounceURLBlocker(cfg.AnnounceURL); blocker != "" {
+		return &AuthRequiredError{
+			TrackerID: "NETHD",
+			Reason:    "announce_url invalid or missing",
+			Err:       errors.New("trackers: NETHD announce_url with passkey is required"),
+		}
+	}
+	baseURL := resolveAuthBaseURL(cfg, nethdDefaultBaseURL)
+	cookieDomain := "nethd.org"
+	if parsed, parseErr := url.Parse(baseURL); parseErr == nil && parsed.Hostname() != "" {
+		cookieDomain = parsed.Hostname()
+	}
+	values, err := cookies.LoadTrackerHTTPCookies(ctx, dbPath, "NETHD", cookieDomain)
+	if err != nil || len(values) == 0 {
+		return &AuthRequiredError{TrackerID: "NETHD", Reason: "cookies missing", Err: cookieLoadError("NETHD", err)}
+	}
+	return validateNETHDStoredCookies(ctx, baseURL, values)
+}
+
+// validateNETHDStoredCookies checks the upload page without mutating cookie
+// storage. Only concrete logged-out evidence invalidates the session; transport,
+// body-read, and unexpected HTTP failures are transient.
+func validateNETHDStoredCookies(ctx context.Context, baseURL string, values []*http.Cookie) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, joinAuthURL(baseURL, nethdUploadPath), nil)
+	if err != nil {
+		return fmt.Errorf("trackers: NETHD session validation request build: %w", err)
+	}
+	req.Header.Set("User-Agent", "upbrr")
+	commonhttp.ApplyCookies(req, values)
+
+	resp, err := noRedirectHTTPClient().Do(req)
+	if err != nil {
+		return &ValidationError{TrackerID: "NETHD", Transient: true, Reason: "remote validation unavailable", Err: fmt.Errorf("trackers: NETHD session validation request: %w", err)}
+	}
+	defer resp.Body.Close()
+	body, readErr := readTrackerAuthResponseBody(resp, resp.StatusCode >= 200 && resp.StatusCode < 300)
+	if readErr != nil {
+		return &ValidationError{TrackerID: "NETHD", Transient: true, Reason: "remote validation unavailable", Err: readErr}
+	}
+	if isLoginRedirect(resp) || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return &ValidationError{TrackerID: "NETHD", ConfirmedInvalid: true, Reason: "stored session expired", Err: fmt.Errorf("trackers: NETHD session validation failed status=%d", resp.StatusCode)}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return &ValidationError{TrackerID: "NETHD", Transient: true, Reason: "remote validation failed", Err: fmt.Errorf("trackers: NETHD session validation failed status=%d", resp.StatusCode)}
+	}
+	if nethdLooksLoggedOut(string(body)) {
+		return &ValidationError{TrackerID: "NETHD", ConfirmedInvalid: true, Reason: "stored session expired", Err: errors.New("trackers: NETHD login page returned")}
+	}
+	if !nethdLooksLoggedIn(string(body)) {
+		return &ValidationError{TrackerID: "NETHD", Transient: true, Reason: "remote validation failed", Err: errors.New("trackers: NETHD logout marker not found")}
+	}
+	return nil
+}
+
+func nethdAnnounceURLBlocker(rawURL string) string {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return nethdAnnounceMissingMessage
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Hostname() == "" || parsed.User != nil ||
+		(!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) {
+		return nethdAnnounceInvalidMessage
+	}
+	foundPasskey := false
+	for key, values := range parsed.Query() {
+		if !strings.EqualFold(strings.TrimSpace(key), "passkey") {
+			continue
+		}
+		foundPasskey = true
+		if len(values) == 0 {
+			return nethdAnnouncePasskeyMessage
+		}
+		for _, value := range values {
+			passkey := strings.TrimSpace(value)
+			if passkey == "" {
+				return nethdAnnouncePasskeyMessage
+			}
+			if nethdPasskeyIsPlaceholder(passkey) {
+				return nethdAnnouncePlaceholderMessage
+			}
+		}
+	}
+	if !foundPasskey {
+		return nethdAnnouncePasskeyMessage
+	}
+	return ""
+}
+
+func nethdPasskeyIsPlaceholder(value string) bool {
+	normalized := strings.ToUpper(strings.TrimSpace(value))
+	normalized = strings.Trim(normalized, "<>[]{}()")
+	normalized = strings.NewReplacer("-", "_", " ", "_").Replace(normalized)
+	return normalized == "PASSKEY" || normalized == "YOUR_PASSKEY"
+}
+
 // resolveTHRSessionForTrackerAuth validates THR credentials using the same
 // browser-style session bootstrap as uploads. THR logs in per request and does
 // not persist cookies in tracker-auth storage.
@@ -591,4 +698,41 @@ func flLooksLoggedIn(body string) bool {
 func flLooksLoggedOut(body string) bool {
 	lower := strings.ToLower(body)
 	return strings.Contains(lower, "login.php") || strings.Contains(lower, "name=\"username\"") || strings.Contains(lower, "name=\"password\"")
+}
+
+// nethdLooksLoggedIn recognizes the logout.php link present in authenticated
+// NexusPHP pages without depending on translated link text.
+func nethdLooksLoggedIn(body string) bool {
+	tokenizer := html.NewTokenizer(strings.NewReader(body))
+	for {
+		switch tokenizer.Next() {
+		case html.ErrorToken:
+			return false
+		case html.StartTagToken, html.SelfClosingTagToken:
+			token := tokenizer.Token()
+			if !strings.EqualFold(token.Data, "a") {
+				continue
+			}
+			for _, attr := range token.Attr {
+				if !strings.EqualFold(attr.Key, "href") {
+					continue
+				}
+				candidate, err := url.Parse(strings.TrimSpace(attr.Val))
+				if err == nil && strings.EqualFold(strings.TrimPrefix(candidate.Path, "/"), "logout.php") {
+					return true
+				}
+			}
+		case html.TextToken, html.EndTagToken, html.CommentToken, html.DoctypeToken:
+			continue
+		}
+	}
+}
+
+func nethdLooksLoggedOut(body string) bool {
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "takelogin.php") ||
+		strings.Contains(lower, "name=\"username\"") ||
+		strings.Contains(lower, "name='username'") ||
+		strings.Contains(lower, "name=\"password\"") ||
+		strings.Contains(lower, "name='password'")
 }

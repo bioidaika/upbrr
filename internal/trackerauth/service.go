@@ -228,7 +228,7 @@ func (s *Service) ImportCookies(ctx context.Context, trackerID string, fileName 
 		return api.TrackerAuthStatus{}, fmt.Errorf("tracker auth: import %s cookies: %w", spec.id, err)
 	}
 	status = s.statusForSpec(ctx, spec)
-	if status.State != StateLoginRequired || !isBTNSpec(spec) || !strings.Contains(status.Message, "API key is required") {
+	if !preserveCookieImportBlocker(spec, status) {
 		status.State = StateHasCookies
 		status.Message = "cookies imported"
 	}
@@ -268,6 +268,12 @@ func (s *Service) Validate(ctx context.Context, trackerID string) (status api.Tr
 		if ensureErr != nil {
 			status = s.statusForSpec(ctx, spec)
 			applyEnsureErrorToStatus(&status, ensureErr)
+			if isNETHDSpec(spec) {
+				if blocker := nethdAnnounceURLBlocker(mustTrackerConfig(s.cfg, spec.id).AnnounceURL); blocker != "" {
+					status.State = StateLoginRequired
+					status.Message = blocker
+				}
+			}
 			if session.ChallengeID != "" {
 				status.ChallengeID = session.ChallengeID
 			}
@@ -592,12 +598,22 @@ func (s *Service) statusForSpec(ctx context.Context, spec trackerSpec) api.Track
 	if !missingBTNAPIKey && spec.cookies && status.CookieCount == 0 && !encryptedStorage && authStatusRequiresEncryptedStorage(spec, hasCredentials, hasAPIKey, hasPasskey) {
 		status.State = StateEncryptedStorageUnavailable
 	}
+	nethdBlocker := ""
+	if isNETHDSpec(spec) {
+		nethdBlocker = nethdAnnounceURLBlocker(cfg.AnnounceURL)
+	}
+	if nethdBlocker != "" {
+		status.State = StateLoginRequired
+	}
 	status.Message = validationMessage(spec, status)
 	if status.State != StateEncryptedStorageUnavailable && uploadAuthNeedsCookiesOrLogin(spec) && hasAPIKey && status.CookieCount == 0 && !hasCredentials {
 		status.Message = uploadAuthRequiredMessage(spec)
 	}
 	if missingBTNAPIKey {
 		status.Message = btnMissingAPIKeyMessage()
+	}
+	if nethdBlocker != "" {
+		status.Message = nethdBlocker
 	}
 	return status
 }
@@ -633,6 +649,22 @@ func isBTNSpec(spec trackerSpec) bool {
 
 func isHDBSpec(spec trackerSpec) bool {
 	return strings.EqualFold(spec.id, "HDB")
+}
+
+func isNETHDSpec(spec trackerSpec) bool {
+	return strings.EqualFold(spec.id, "NETHD")
+}
+
+// preserveCookieImportBlocker keeps independent tracker prerequisites visible
+// after a successful cookie import instead of reporting a false ready state.
+func preserveCookieImportBlocker(spec trackerSpec, status api.TrackerAuthStatus) bool {
+	if status.State != StateLoginRequired {
+		return false
+	}
+	if isBTNSpec(spec) && strings.Contains(status.Message, "API key is required") {
+		return true
+	}
+	return isNETHDSpec(spec) && strings.Contains(status.Message, "announce_url")
 }
 
 // uploadAuthNeedsCookiesOrLogin reports trackers where an API key is necessary
@@ -794,6 +826,7 @@ func builtInSpecs() []trackerSpec {
 		{id: "HDS", authKind: "cookies", cookies: true},
 		{id: "HDT", authKind: "cookies", cookies: true},
 		{id: "IS", authKind: "cookies", cookies: true},
+		{id: "NETHD", authKind: "cookies", cookies: true, notes: []string{"A personal announce_url with a passkey query parameter is also required for upload."}},
 		{id: "PHD", authKind: "cookies", cookies: true},
 		{id: "PTS", authKind: "cookies", cookies: true},
 		{id: "TL", authKind: "cookies", cookies: true},

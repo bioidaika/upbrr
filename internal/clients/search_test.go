@@ -806,6 +806,61 @@ func TestMatchTrackerURLsMatchesCZTAnnounce(t *testing.T) {
 	}
 }
 
+func TestMatchTrackerURLsMatchesNETHDAnnounce(t *testing.T) {
+	t.Parallel()
+
+	matched := matchTrackerURLs([]string{"https://nethd.org/announce.php?passkey=redacted"})
+	if !containsString(matched, "NETHD") {
+		t.Fatalf("expected NETHD in matched trackers, got %v", matched)
+	}
+}
+
+func TestExtractTrackerMatchesHandlesNETHDComments(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		comment string
+		wantID  string
+	}{
+		{
+			name:    "nexusphp details",
+			comment: "https://nethd.org/details.php?id=12001&uploaded=1",
+			wantID:  "12001",
+		},
+		{
+			name:    "slug before torrent id",
+			comment: "https://nethd.org/example-release-2026-1080p-torrent-12002.html",
+			wantID:  "12002",
+		},
+		{
+			name:    "torrent id before slug",
+			comment: "https://nethd.org/torrent-12003-example-release-2026.html",
+			wantID:  "12003",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			matches, found := extractTrackerMatches(
+				test.comment,
+				[]string{"https://nethd.org/announce.php?passkey=redacted"},
+				true,
+				[]string{"nethd"},
+			)
+
+			if !found {
+				t.Fatalf("expected NETHD tracker match")
+			}
+			if len(matches) != 1 || matches[0].ID != "nethd" || matches[0].TrackerID != test.wantID {
+				t.Fatalf("expected NETHD tracker id %s, got %#v", test.wantID, matches)
+			}
+		})
+	}
+}
+
 func TestEnsureMatchedTrackersForKnownIDsAddsBTN(t *testing.T) {
 	t.Parallel()
 

@@ -406,6 +406,66 @@ func TestPrepareTrackerUploadTorrentSkipsBTNWithoutAnnounceURL(t *testing.T) {
 	}
 }
 
+func TestPrepareTrackerUploadTorrentUsesNETHDAnnounceURL(t *testing.T) {
+	t.Parallel()
+
+	tmp := t.TempDir()
+	sourcePath := filepath.Join(tmp, "Release.mkv")
+	if err := os.WriteFile(sourcePath, []byte("data"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	baseTorrentPath := filepath.Join(tmp, "base.torrent")
+	writeTestMetaInfo(t, baseTorrentPath, metainfo.MetaInfo{InfoBytes: testInfoBytes(t, "")})
+
+	meta, err := PrepareTrackerUploadTorrent(api.PreparedMetadata{
+		SourcePath:  sourcePath,
+		TorrentPath: baseTorrentPath,
+	}, filepath.Join(tmp, "state", "upbrr.db"), "nethd", config.TrackerConfig{AnnounceURL: " https://tracker.nethd.example/announce.php?passkey=test-passkey "})
+	if err != nil {
+		t.Fatalf("prepare tracker torrent: %v", err)
+	}
+	if meta.TorrentPath == "" || meta.TorrentPath == baseTorrentPath {
+		t.Fatalf("expected NETHD tracker artifact path, got %q", meta.TorrentPath)
+	}
+	artifact := readTestMetaInfo(t, meta.TorrentPath)
+	if artifact.Announce != "https://tracker.nethd.example/announce.php?passkey=test-passkey" {
+		t.Fatal("expected the configured NETHD announce URL")
+	}
+	assertInfoSource(t, artifact, "nethd.org")
+}
+
+func TestPrepareTrackerUploadTorrentSkipsNETHDWithoutAnnounceURL(t *testing.T) {
+	t.Parallel()
+
+	tmp := t.TempDir()
+	sourcePath := filepath.Join(tmp, "Release.mkv")
+	if err := os.WriteFile(sourcePath, []byte("data"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	baseTorrentPath := filepath.Join(tmp, "base.torrent")
+	writeTestMetaInfo(t, baseTorrentPath, metainfo.MetaInfo{InfoBytes: testInfoBytes(t, "")})
+
+	dbPath := filepath.Join(tmp, "state", "upbrr.db")
+	meta := api.PreparedMetadata{
+		SourcePath:  sourcePath,
+		TorrentPath: baseTorrentPath,
+	}
+	got, err := PrepareTrackerUploadTorrent(meta, dbPath, "NETHD", config.TrackerConfig{})
+	if err != nil {
+		t.Fatalf("prepare tracker torrent: %v", err)
+	}
+	if got.TorrentPath != baseTorrentPath {
+		t.Fatalf("expected NETHD torrent path unchanged without announce URL, got %q", got.TorrentPath)
+	}
+	artifactPath, err := ResolveTrackerTorrentArtifactPath(meta, dbPath, "NETHD")
+	if err != nil {
+		t.Fatalf("resolve NETHD artifact path: %v", err)
+	}
+	if _, err := os.Stat(artifactPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("expected no NETHD artifact without announce URL")
+	}
+}
+
 func TestPrepareTrackerUploadTorrentNoSpecLeavesMetaUnchanged(t *testing.T) {
 	t.Parallel()
 

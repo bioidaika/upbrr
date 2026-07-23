@@ -42,6 +42,8 @@ func defaultAdapters() map[string]Adapter {
 			adapters[spec.id] = trackerAdapter{capability: capabilityFromSpec(spec), resolve: resolveHDBStoredSessionForTrackerAuth}
 		case "MTV":
 			adapters[spec.id] = trackerAdapter{capability: capabilityFromSpec(spec), resolve: mtv.ResolveSessionForTrackerAuthLogin}
+		case "NETHD":
+			adapters[spec.id] = trackerAdapter{capability: capabilityFromSpec(spec), resolve: resolveNETHDStoredSessionForTrackerAuth}
 		case "PTP":
 			adapters[spec.id] = trackerAdapter{capability: capabilityFromSpec(spec), resolve: ptp.ResolveSessionForTrackerAuthLogin}
 		case "RTF":

@@ -30,6 +30,27 @@ func TestFinalizeTrackerDescriptionPTS(t *testing.T) {
 	}
 }
 
+func TestFinalizeTrackerDescriptionNETHD(t *testing.T) {
+	input := "[user]ExampleUser[/user]\n\n\n[spoiler=Details]named[/spoiler]\n[spoiler]plain[/spoiler]\n[img width=500]https://img.example/main.png[/img]\n[comparison=A, B]https://img.example/a.png https://img.example/b.png[/comparison]"
+	got := FinalizeTrackerDescription("nethd", input)
+
+	if strings.Contains(got, "[user]") || strings.Contains(got, "[/user]") {
+		t.Fatalf("expected user tags removed for NETHD, got %q", got)
+	}
+	if !strings.Contains(got, "[hide=Details]named[/hide]") || !strings.Contains(got, "[hide]plain[/hide]") {
+		t.Fatalf("expected spoilers converted to hide tags for NETHD, got %q", got)
+	}
+	if !strings.Contains(got, "[img]https://img.example/main.png[/img]") {
+		t.Fatalf("expected image resize removed for NETHD, got %q", got)
+	}
+	if !strings.Contains(got, "[center]A | B") || strings.Contains(got, "[comparison=") {
+		t.Fatalf("expected comparison centered for NETHD, got %q", got)
+	}
+	if strings.Contains(got, "\n\n\n") {
+		t.Fatalf("expected extra lines removed for NETHD, got %q", got)
+	}
+}
+
 func TestFinalizeTrackerDescriptionTL(t *testing.T) {
 	input := "[center]x[/center]\n[comparison=A, B]https://img.example/a.png https://img.example/b.png[/comparison]\n[note]n[/note]"
 	got := FinalizeTrackerDescription("TL", input)

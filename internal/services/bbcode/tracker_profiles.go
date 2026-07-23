@@ -44,6 +44,8 @@ func FinalizeTrackerDescription(tracker string, desc string) string {
 		return finalizeHDTDescription(trimmed)
 	case "IS":
 		return finalizeISDescription(trimmed)
+	case "NETHD":
+		return finalizeNETHDDescription(trimmed)
 	case "PTS":
 		return finalizePTSDescription(trimmed)
 	case "SPD":
@@ -188,6 +190,14 @@ func finalizeHDTDescription(value string) string {
 }
 
 func finalizeISDescription(value string) string {
+	return removeExtraLines(value)
+}
+
+func finalizeNETHDDescription(value string) string {
+	value = strings.NewReplacer("[user]", "", "[/user]", "").Replace(value)
+	value = convertSpoilerToHide(value)
+	value = removeImgResize(value)
+	value = convertComparisonToCentered(value, 1000)
 	return removeExtraLines(value)
 }
 

@@ -361,6 +361,11 @@ trackers:
     api_key: ""
     url: "https://nebulance.io"
     announce_url: ""
+  NETHD:
+    link_dir_name: ""
+    url: "https://nethd.org"
+    announce_url: ""
+    full_mediainfo: false
   OE:
     link_dir_name: ""
     api_key: ""

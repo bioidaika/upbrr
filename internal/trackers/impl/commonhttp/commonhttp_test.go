@@ -4,9 +4,12 @@
 package commonhttp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -59,6 +62,115 @@ func TestReadUploadResponseBodyUsesFullSuccessAndBoundedFailurePreview(t *testin
 
 func ioNopCloser(value string) io.ReadCloser {
 	return io.NopCloser(strings.NewReader(value))
+}
+
+func TestMultipartPayloadBuildersHonorFileContentTypeAndEscapeDisposition(t *testing.T) {
+	t.Parallel()
+
+	builders := []struct {
+		name  string
+		build func([]FileField) ([]byte, string, error)
+	}{
+		{
+			name: "single-value fields",
+			build: func(files []FileField) ([]byte, string, error) {
+				return BuildMultipartPayload(nil, files)
+			},
+		},
+		{
+			name: "multi-value fields",
+			build: func(files []FileField) ([]byte, string, error) {
+				return BuildMultipartPayloadMulti(nil, files)
+			},
+		},
+	}
+	contentTypes := []struct {
+		name string
+		set  string
+		want string
+	}{
+		{name: "custom", set: "application/x-bittorrent", want: "application/x-bittorrent"},
+		{name: "default", want: "application/octet-stream"},
+	}
+
+	for _, builder := range builders {
+		for _, contentType := range contentTypes {
+			t.Run(builder.name+"/"+contentType.name, func(t *testing.T) {
+				t.Parallel()
+
+				body, header, err := builder.build([]FileField{{
+					FieldName:   `torrent"field`,
+					FileName:    `Example "Release".torrent`,
+					ContentType: contentType.set,
+					Content:     []byte("torrent payload"),
+				}})
+				if err != nil {
+					t.Fatalf("build multipart payload: %v", err)
+				}
+
+				mediaType, params, err := mime.ParseMediaType(header)
+				if err != nil {
+					t.Fatalf("parse multipart content type: %v", err)
+				}
+				if mediaType != "multipart/form-data" || params["boundary"] == "" {
+					t.Fatalf("unexpected multipart content type %q", header)
+				}
+				reader := multipart.NewReader(bytes.NewReader(body), params["boundary"])
+				part, err := reader.NextPart()
+				if err != nil {
+					t.Fatalf("read multipart file part: %v", err)
+				}
+				defer part.Close()
+
+				if got := part.FormName(); got != `torrent"field` {
+					t.Fatalf("form name = %q, want escaped source value", got)
+				}
+				if got := part.FileName(); got != `Example "Release".torrent` {
+					t.Fatalf("file name = %q, want escaped source value", got)
+				}
+				if got := part.Header.Get("Content-Type"); got != contentType.want {
+					t.Fatalf("file content type = %q, want %q", got, contentType.want)
+				}
+				payload, err := io.ReadAll(part)
+				if err != nil {
+					t.Fatalf("read multipart file payload: %v", err)
+				}
+				if string(payload) != "torrent payload" {
+					t.Fatalf("file payload = %q", payload)
+				}
+			})
+		}
+	}
+}
+
+func TestBuildMultipartPayloadRejectsUnsafeFileHeaders(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		file FileField
+	}{
+		{
+			name: "field name newline",
+			file: FileField{FieldName: "torrent\r\nX-Injected: true", FileName: "release.torrent", Content: []byte("payload")},
+		},
+		{
+			name: "file name newline",
+			file: FileField{FieldName: "torrent", FileName: "release.torrent\r\nX-Injected: true", Content: []byte("payload")},
+		},
+		{
+			name: "content type newline",
+			file: FileField{FieldName: "torrent", FileName: "release.torrent", ContentType: "application/x-bittorrent\r\nX-Injected: true", Content: []byte("payload")},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if _, _, err := BuildMultipartPayload(nil, []FileField{test.file}); err == nil {
+				t.Fatal("expected unsafe multipart header to be rejected")
+			}
+		})
+	}
 }
 
 func TestLoadCookiesForTrackerUsesCookieStoreWhenNoStartupCookieExists(t *testing.T) {
