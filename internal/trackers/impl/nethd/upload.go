@@ -8,22 +8,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 
-	"github.com/anacrolix/torrent/metainfo"
-
 	"github.com/autobrr/upbrr/internal/cookies"
 	"github.com/autobrr/upbrr/internal/httpclient"
 	"github.com/autobrr/upbrr/internal/metadata/metautil"
-	"github.com/autobrr/upbrr/internal/redaction"
 	"github.com/autobrr/upbrr/internal/services/bbcode"
 	descriptionunit3d "github.com/autobrr/upbrr/internal/services/description/unit3d"
 	"github.com/autobrr/upbrr/internal/trackers"
@@ -32,10 +27,9 @@ import (
 )
 
 const (
-	trackerName             = "NETHD"
-	defaultBaseURL          = "https://nethd.org"
-	sourceFlag              = "nethd.org"
-	maxTorrentDownloadBytes = 32 * 1024 * 1024
+	trackerName    = "NETHD"
+	defaultBaseURL = "https://nethd.org"
+	sourceFlag     = "[nethd.org] NetHD.org"
 )
 
 var (
@@ -106,11 +100,6 @@ func upload(ctx context.Context, req trackers.UploadRequest) (api.UploadSummary,
 
 	torrentID, torrentURL, resultErr := parseUploadResult(state.baseURL, resp.Header.Get("Location"))
 	if successCandidate && resultErr == nil && torrentID != "" {
-		artifactPath := state.torrentPath
-		downloadURL := buildDownloadURL(state.baseURL, torrentID, req.TrackerConfig.AnnounceURL)
-		if err := downloadPersonalizedTorrent(ctx, state.baseURL, downloadURL, artifactPath, trackerCookies); err != nil {
-			logger.Warnf("trackers: personalized torrent download failed tracker=%s; using prepared artifact: %s", trackerName, redaction.RedactValue(err.Error(), nil))
-		}
 		logger.Infof("trackers: upload succeeded tracker=%s torrent_id=%s", trackerName, torrentID)
 		return api.UploadSummary{
 			Uploaded: 1,
@@ -119,7 +108,7 @@ func upload(ctx context.Context, req trackers.UploadRequest) (api.UploadSummary,
 				TorrentID:   torrentID,
 				TorrentURL:  torrentURL,
 				DownloadURL: state.baseURL + "/download.php?id=" + url.QueryEscape(torrentID),
-				TorrentPath: artifactPath,
+				TorrentPath: state.torrentPath,
 			}},
 		}, nil
 	}
@@ -386,31 +375,6 @@ func isRedirectStatus(status int) bool {
 	}
 }
 
-func buildDownloadURL(baseURL string, torrentID string, announceURL string) string {
-	parsed, _ := url.Parse(strings.TrimRight(baseURL, "/") + "/download.php")
-	query := parsed.Query()
-	query.Set("id", strings.TrimSpace(torrentID))
-	if passkey := passkeyFromAnnounceURL(announceURL); passkey != "" {
-		query.Set("passkey", passkey)
-	}
-	parsed.RawQuery = query.Encode()
-	return parsed.String()
-}
-
-func passkeyFromAnnounceURL(announceURL string) string {
-	parsed, err := url.Parse(strings.TrimSpace(announceURL))
-	if err != nil {
-		return ""
-	}
-	for key, values := range parsed.Query() {
-		if !strings.EqualFold(strings.TrimSpace(key), "passkey") || len(values) == 0 {
-			continue
-		}
-		return strings.TrimSpace(values[0])
-	}
-	return ""
-}
-
 func validateAnnounceURL(announceURL string) error {
 	if strings.TrimSpace(announceURL) == "" {
 		return errors.New("announce_url is required")
@@ -449,172 +413,6 @@ func isPlaceholderPasskey(value string) bool {
 	normalized = strings.Trim(normalized, "<>[]{}()")
 	normalized = strings.NewReplacer("-", "_", " ", "_").Replace(normalized)
 	return normalized == "PASSKEY" || normalized == "YOUR_PASSKEY"
-}
-
-func downloadPersonalizedTorrent(ctx context.Context, baseURL string, downloadURL string, outputPath string, trackerCookies []*http.Cookie) error {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
-	if err != nil {
-		return fmt.Errorf("build torrent download request: %w", err)
-	}
-	request.Header.Set("User-Agent", "upbrr")
-	commonhttp.ApplyCookies(request, trackerCookies)
-
-	client := httpclient.CloneWithTimeout(&http.Client{
-		CheckRedirect: func(req *http.Request, _ []*http.Request) error {
-			_, err := resolveSameOriginURL(baseURL, req.URL.String())
-			return err
-		},
-	}, httpclient.DefaultTimeout)
-	response, err := client.Do(request)
-	if err != nil {
-		return fmt.Errorf("torrent download request: %w", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("torrent download failed status=%d", response.StatusCode)
-	}
-	if strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/html") {
-		return errors.New("torrent download returned HTML")
-	}
-	payload, err := io.ReadAll(io.LimitReader(response.Body, maxTorrentDownloadBytes+1))
-	if err != nil {
-		return fmt.Errorf("read torrent download: %w", err)
-	}
-	if len(payload) > maxTorrentDownloadBytes {
-		return errors.New("torrent download exceeds size limit")
-	}
-	if err := validateDownloadedTorrent(payload, outputPath); err != nil {
-		return err
-	}
-	if err := replaceTorrentFile(outputPath, payload); err != nil {
-		return fmt.Errorf("persist downloaded torrent: %w", err)
-	}
-	return nil
-}
-
-func validateDownloadedTorrent(payload []byte, expectedPath string) error {
-	if len(payload) == 0 || payload[0] != 'd' {
-		return errors.New("torrent download is not a bencoded dictionary")
-	}
-	downloaded, err := metainfo.Load(bytes.NewReader(payload))
-	if err != nil {
-		return fmt.Errorf("parse downloaded torrent: %w", err)
-	}
-	if _, err := downloaded.UnmarshalInfo(); err != nil {
-		return fmt.Errorf("parse downloaded torrent info: %w", err)
-	}
-	expected, err := metainfo.LoadFromFile(expectedPath)
-	if err != nil {
-		return fmt.Errorf("load prepared torrent: %w", err)
-	}
-	if downloaded.HashInfoBytes().String() != expected.HashInfoBytes().String() {
-		return errors.New("downloaded torrent info hash does not match uploaded torrent")
-	}
-	if !hasOnlyExpectedAnnounce(downloaded, strings.TrimSpace(expected.Announce)) {
-		return errors.New("downloaded torrent announce does not match the prepared torrent")
-	}
-	return nil
-}
-
-func hasOnlyExpectedAnnounce(torrentMeta *metainfo.MetaInfo, expectedAnnounce string) bool {
-	if torrentMeta == nil || expectedAnnounce == "" {
-		return false
-	}
-	found := false
-	check := func(value string) bool {
-		trimmed := strings.TrimSpace(value)
-		if trimmed == "" {
-			return true
-		}
-		if trimmed != expectedAnnounce {
-			return false
-		}
-		found = true
-		return true
-	}
-	if !check(torrentMeta.Announce) {
-		return false
-	}
-	for _, tier := range torrentMeta.AnnounceList {
-		for _, announce := range tier {
-			if !check(announce) {
-				return false
-			}
-		}
-	}
-	return found
-}
-
-func replaceTorrentFile(outputPath string, payload []byte) error {
-	dir := filepath.Dir(outputPath)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create torrent directory: %w", err)
-	}
-	staged, err := os.CreateTemp(dir, filepath.Base(outputPath)+".tmp-*")
-	if err != nil {
-		return fmt.Errorf("create staged torrent: %w", err)
-	}
-	stagedPath := staged.Name()
-	removeStaged := true
-	defer func() {
-		if removeStaged {
-			_ = os.Remove(stagedPath)
-		}
-	}()
-	if err := staged.Chmod(0o600); err != nil {
-		_ = staged.Close()
-		return fmt.Errorf("chmod staged torrent: %w", err)
-	}
-	if _, err := staged.Write(payload); err != nil {
-		_ = staged.Close()
-		return fmt.Errorf("write staged torrent: %w", err)
-	}
-	if err := staged.Sync(); err != nil {
-		_ = staged.Close()
-		return fmt.Errorf("sync staged torrent: %w", err)
-	}
-	if err := staged.Close(); err != nil {
-		return fmt.Errorf("close staged torrent: %w", err)
-	}
-
-	if _, err := os.Stat(outputPath); err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("stat existing torrent: %w", err)
-		}
-		if err := os.Rename(stagedPath, outputPath); err != nil {
-			return fmt.Errorf("install staged torrent: %w", err)
-		}
-		removeStaged = false
-		return nil
-	}
-
-	backup, err := os.CreateTemp(dir, filepath.Base(outputPath)+".backup-*")
-	if err != nil {
-		return fmt.Errorf("reserve torrent backup: %w", err)
-	}
-	backupPath := backup.Name()
-	if err := backup.Close(); err != nil {
-		_ = os.Remove(backupPath)
-		return fmt.Errorf("close torrent backup reservation: %w", err)
-	}
-	if err := os.Remove(backupPath); err != nil {
-		return fmt.Errorf("release torrent backup reservation: %w", err)
-	}
-	if err := os.Rename(outputPath, backupPath); err != nil {
-		return fmt.Errorf("backup existing torrent: %w", err)
-	}
-	if err := os.Rename(stagedPath, outputPath); err != nil {
-		restoreErr := os.Rename(backupPath, outputPath)
-		if restoreErr != nil {
-			return errors.Join(fmt.Errorf("install staged torrent: %w", err), fmt.Errorf("restore existing torrent: %w", restoreErr))
-		}
-		return fmt.Errorf("install staged torrent: %w", err)
-	}
-	removeStaged = false
-	if err := os.Remove(backupPath); err != nil {
-		return fmt.Errorf("remove torrent backup: %w", err)
-	}
-	return nil
 }
 
 func resolveName(meta api.PreparedMetadata) string {

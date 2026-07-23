@@ -53,7 +53,7 @@ var trackerUploadTorrentSpecs = map[string]trackerUploadTorrentSpec{
 	"IS":    {source: "https://immortalseed.me"},
 	"MTV":   {source: "MTV"},
 	"NBL":   {source: "NBL"},
-	"NETHD": {source: "nethd.org", requireAnnounce: true},
+	"NETHD": {source: "[nethd.org] NetHD.org", requireAnnounce: true},
 	"PHD":   {source: "PrivateHD", defaultAnnounce: "https://tracker.privatehd.to/announce"},
 	"PTP":   {source: "PTP"},
 	"PTS":   {source: "[www.ptskit.org] PTSKIT"},

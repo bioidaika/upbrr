@@ -431,7 +431,7 @@ func TestPrepareTrackerUploadTorrentUsesNETHDAnnounceURL(t *testing.T) {
 	if artifact.Announce != "https://tracker.nethd.example/announce.php?passkey=test-passkey" {
 		t.Fatal("expected the configured NETHD announce URL")
 	}
-	assertInfoSource(t, artifact, "nethd.org")
+	assertInfoSource(t, artifact, "[nethd.org] NetHD.org")
 }
 
 func TestPrepareTrackerUploadTorrentSkipsNETHDWithoutAnnounceURL(t *testing.T) {

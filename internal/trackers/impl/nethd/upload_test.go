@@ -239,7 +239,7 @@ func TestValidateAnnounceURLRequiresPasskey(t *testing.T) {
 	}
 }
 
-func TestUploadPostsMultipartAndKeepsPersonalizedTorrent(t *testing.T) {
+func TestUploadPostsMultipartAndKeepsLocallyGeneratedTorrent(t *testing.T) {
 	tmp := t.TempDir()
 	dbPath := filepath.Join(tmp, "upbrr.db")
 	mediaPath := filepath.Join(tmp, "Example.Release.2026.mkv")
@@ -247,10 +247,10 @@ func TestUploadPostsMultipartAndKeepsPersonalizedTorrent(t *testing.T) {
 	createNETHDTestTorrent(t, mediaPath, torrentPath)
 
 	var (
-		mu              sync.Mutex
-		uploadedTorrent []byte
-		uploadFields    map[string]string
-		downloadQuery   url.Values
+		mu               sync.Mutex
+		uploadedTorrent  []byte
+		uploadFields     map[string]string
+		downloadRequests int
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if cookie, err := request.Cookie("session"); err != nil || cookie.Value != "test-session" {
@@ -272,11 +272,9 @@ func TestUploadPostsMultipartAndKeepsPersonalizedTorrent(t *testing.T) {
 			writer.WriteHeader(http.StatusFound)
 		case "/download.php":
 			mu.Lock()
-			downloadQuery = request.URL.Query()
-			payload := append([]byte(nil), uploadedTorrent...)
+			downloadRequests++
 			mu.Unlock()
-			writer.Header().Set("Content-Type", "application/x-bittorrent")
-			_, _ = writer.Write(payload)
+			http.Error(writer, "unexpected torrent download", http.StatusInternalServerError)
 		default:
 			http.NotFound(writer, request)
 		}
@@ -318,24 +316,39 @@ func TestUploadPostsMultipartAndKeepsPersonalizedTorrent(t *testing.T) {
 	if artifact.TorrentID != "123" || artifact.TorrentPath == "" {
 		t.Fatalf("unexpected uploaded torrent: %#v", artifact)
 	}
+	expectedArtifactPath, err := trackers.ResolveTrackerTorrentArtifactPath(req.Meta, dbPath, trackerName)
+	if err != nil {
+		t.Fatalf("resolve tracker artifact path: %v", err)
+	}
+	if artifact.TorrentPath != expectedArtifactPath {
+		t.Fatalf("TorrentPath = %q, want local artifact %q", artifact.TorrentPath, expectedArtifactPath)
+	}
 
 	mu.Lock()
 	fields := uploadFields
-	query := downloadQuery
+	uploadedPayload := append([]byte(nil), uploadedTorrent...)
+	downloadCount := downloadRequests
 	mu.Unlock()
 	if fields["type"] != "401" || fields["source"] != "410" || fields["standard"] != "415" {
 		t.Fatalf("unexpected upload fields: %#v", fields)
 	}
-	if query.Get("id") != "123" || query.Get("passkey") != "test-passkey" {
-		t.Fatalf("unexpected download query: %#v", query)
+	if downloadCount != 0 {
+		t.Fatalf("expected no /download.php request, got %d", downloadCount)
 	}
 
-	torrentMeta, err := metainfo.LoadFromFile(artifact.TorrentPath)
+	artifactPayload, err := os.ReadFile(artifact.TorrentPath)
 	if err != nil {
-		t.Fatalf("load artifact: %v", err)
+		t.Fatalf("read local artifact: %v", err)
+	}
+	if !bytes.Equal(artifactPayload, uploadedPayload) {
+		t.Fatal("local artifact bytes differ from the torrent uploaded to NETHD")
+	}
+	torrentMeta, err := metainfo.Load(bytes.NewReader(artifactPayload))
+	if err != nil {
+		t.Fatalf("parse local artifact: %v", err)
 	}
 	if torrentMeta.Announce != req.TrackerConfig.AnnounceURL {
-		t.Fatal("artifact announce does not match the configured URL")
+		t.Fatalf("announce = %q, want %q", torrentMeta.Announce, req.TrackerConfig.AnnounceURL)
 	}
 	info, err := torrentMeta.UnmarshalInfo()
 	if err != nil {
@@ -344,69 +357,6 @@ func TestUploadPostsMultipartAndKeepsPersonalizedTorrent(t *testing.T) {
 	if info.Source != sourceFlag {
 		t.Fatalf("source = %q, want %q", info.Source, sourceFlag)
 	}
-}
-
-func TestValidateDownloadedTorrentChecksInfoHashAndAnnounce(t *testing.T) {
-	tmp := t.TempDir()
-	firstSource := filepath.Join(tmp, "first.bin")
-	firstTorrent := filepath.Join(tmp, "first.torrent")
-	secondSource := filepath.Join(tmp, "second.bin")
-	secondTorrent := filepath.Join(tmp, "second.torrent")
-	createNETHDTestTorrent(t, firstSource, firstTorrent)
-	if err := os.WriteFile(secondSource, []byte("different data"), 0o600); err != nil {
-		t.Fatalf("write second source: %v", err)
-	}
-	prepared, err := metainfo.LoadFromFile(firstTorrent)
-	if err != nil {
-		t.Fatalf("load prepared torrent: %v", err)
-	}
-	const announceURL = "https://nethd.example/announce.php?passkey=fixture-passkey"
-	prepared.Announce = announceURL
-	prepared.AnnounceList = metainfo.AnnounceList{{announceURL}}
-	preparedPayload := encodeNETHDMetaInfo(t, prepared)
-	if err := os.WriteFile(firstTorrent, preparedPayload, 0o600); err != nil {
-		t.Fatalf("write prepared torrent: %v", err)
-	}
-	_, err = mkbrr.Create(mkbrr.CreateOptions{Path: secondSource, OutputPath: secondTorrent, IsPrivate: true})
-	if err != nil {
-		t.Fatalf("create second torrent: %v", err)
-	}
-
-	if err := validateDownloadedTorrent([]byte("<html>login</html>"), firstTorrent); err == nil {
-		t.Fatal("expected HTML response rejection")
-	}
-	secondPayload, err := os.ReadFile(secondTorrent)
-	if err != nil {
-		t.Fatalf("read second torrent: %v", err)
-	}
-	if err := validateDownloadedTorrent(secondPayload, firstTorrent); err == nil {
-		t.Fatal("expected mismatched info hash rejection")
-	}
-	if err := validateDownloadedTorrent(preparedPayload, firstTorrent); err != nil {
-		t.Fatalf("expected matching personalized torrent: %v", err)
-	}
-
-	missingAnnounce := *prepared
-	missingAnnounce.Announce = ""
-	missingAnnounce.AnnounceList = nil
-	if err := validateDownloadedTorrent(encodeNETHDMetaInfo(t, &missingAnnounce), firstTorrent); err == nil {
-		t.Fatal("expected missing announce rejection")
-	}
-
-	wrongAnnounce := *prepared
-	wrongAnnounce.AnnounceList = metainfo.AnnounceList{{announceURL, "https://outside.example/announce"}}
-	if err := validateDownloadedTorrent(encodeNETHDMetaInfo(t, &wrongAnnounce), firstTorrent); err == nil {
-		t.Fatal("expected unexpected announce rejection")
-	}
-}
-
-func encodeNETHDMetaInfo(t *testing.T, torrentMeta *metainfo.MetaInfo) []byte {
-	t.Helper()
-	var payload bytes.Buffer
-	if err := torrentMeta.Write(&payload); err != nil {
-		t.Fatalf("encode torrent: %v", err)
-	}
-	return payload.Bytes()
 }
 
 func createNETHDTestTorrent(t *testing.T, sourcePath string, torrentPath string) {
@@ -469,21 +419,4 @@ func readNETHDUpload(request *http.Request) (map[string]string, []byte, error) {
 		return nil, nil, io.ErrUnexpectedEOF
 	}
 	return fields, torrentBytes, nil
-}
-
-func TestReplaceTorrentFileReplacesExistingFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "artifact.torrent")
-	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
-		t.Fatalf("write old artifact: %v", err)
-	}
-	if err := replaceTorrentFile(path, []byte("new")); err != nil {
-		t.Fatalf("replaceTorrentFile: %v", err)
-	}
-	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read artifact: %v", err)
-	}
-	if !bytes.Equal(got, []byte("new")) {
-		t.Fatalf("artifact = %q, want new", got)
-	}
 }
