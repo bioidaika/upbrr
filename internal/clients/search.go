@@ -113,6 +113,7 @@ var trackerURLPatterns = map[string][]string{
 	"ttr":   {"https://torrenteros.org"},
 	"tvc":   {"https://tvchaosuk.com"},
 	"ulcx":  {"https://upload.cx"},
+	"vmf":   {"tracker.vietmediaf.store"},
 	"yus":   {"https://yu-scene.net"},
 	"znth":  {"https://znth.cx"},
 }

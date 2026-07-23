@@ -117,32 +117,317 @@ func buildVMFName(name string, meta api.PreparedMetadata) string {
 		tag = "ViE"
 	}
 
-	if tag == "" || strings.Contains(strings.ToLower(name), strings.ToLower(tag)) {
+	name, existingTag := stripExistingVMFTags(name)
+	if existingTag == "ViE DUB" || tag == "ViE DUB" {
+		tag = "ViE DUB"
+	} else if existingTag == "ViE" {
+		tag = "ViE"
+	}
+	if tag == "" {
 		return strings.TrimSpace(strings.Join(strings.Fields(name), " "))
 	}
 
-	words := strings.Fields(name)
-	insertIdx := -1
-	parsedRes := strings.ToLower(meta.Release.Resolution)
+	if anchor, ok := findVMFResolutionAnchor(name, meta); ok {
+		return insertVMFTagBeforeToken(name, anchor, tag)
+	}
+	if anchor, ok := findVMFSourceAnchor(name, meta); ok {
+		return insertVMFTagBeforeToken(name, anchor, tag)
+	}
+	if anchor, ok := findVMFReleaseGroupAnchor(name, meta); ok {
+		return insertVMFTagBeforeGroup(name, anchor, tag)
+	}
 
-	// Attempt to find resolution to insert before
-	for i, w := range words {
-		lowerW := strings.ToLower(w)
-		if parsedRes != "" && lowerW == parsedRes {
-			insertIdx = i
-			break
+	separator := preferredVMFSeparator(name, len(name))
+	return strings.TrimSpace(name + separator + renderVMFTag(tag, separator))
+}
+
+type vmfNameToken struct {
+	start int
+	end   int
+	value string
+}
+
+// stripExistingVMFTags removes recognized VMF tag tokens before the name is
+// rebuilt. This lets old trailing tags and duplicate/conflicting tags collapse
+// to one canonical tag without treating title words such as "Movie" or "Vie"
+// as tags. ViE DUB is the strongest existing tag and is never downgraded.
+func stripExistingVMFTags(name string) (string, string) {
+	tokens := tokenizeVMFName(name)
+	removed := make([]bool, len(tokens))
+	existingTag := ""
+	for i, token := range tokens {
+		if !isVMFViETagToken(token.value) {
+			continue
+		}
+		removed[i] = true
+		if i+1 < len(tokens) && strings.EqualFold(tokens[i+1].value, "DUB") {
+			removed[i+1] = true
+			existingTag = "ViE DUB"
+			continue
+		}
+		if existingTag == "" {
+			existingTag = "ViE"
 		}
 	}
 
-	if insertIdx != -1 {
-		newWords := make([]string, 0, len(words)+2)
-		newWords = append(newWords, words[:insertIdx]...)
-		newWords = append(newWords, tag)
-		newWords = append(newWords, words[insertIdx:]...)
-		return strings.Join(newWords, " ")
+	if existingTag == "" {
+		return name, ""
 	}
 
-	return strings.TrimSpace(name + " " + tag)
+	kept := make([]int, 0, len(tokens))
+	for i := range tokens {
+		if !removed[i] {
+			kept = append(kept, i)
+		}
+	}
+	if len(kept) == 0 {
+		return "", existingTag
+	}
+
+	var rebuilt strings.Builder
+	first := kept[0]
+	if first == 0 {
+		rebuilt.WriteString(name[:tokens[first].start])
+	}
+	rebuilt.WriteString(name[tokens[first].start:tokens[first].end])
+	previous := first
+	for _, current := range kept[1:] {
+		if current == previous+1 {
+			rebuilt.WriteString(name[tokens[previous].end:tokens[current].start])
+		} else {
+			rebuilt.WriteString(bridgeVMFTagGap(name, tokens, current))
+		}
+		rebuilt.WriteString(name[tokens[current].start:tokens[current].end])
+		previous = current
+	}
+	if previous == len(tokens)-1 {
+		rebuilt.WriteString(name[tokens[previous].end:])
+	}
+
+	return strings.TrimSpace(rebuilt.String()), existingTag
+}
+
+func bridgeVMFTagGap(name string, tokens []vmfNameToken, next int) string {
+	if next <= 0 || next >= len(tokens) {
+		return ""
+	}
+	gapBeforeNext := name[tokens[next-1].end:tokens[next].start]
+	if strings.Contains(gapBeforeNext, "-") {
+		return "-"
+	}
+	return preferredVMFSeparator(name, tokens[next].start)
+}
+
+func isVMFViETagToken(value string) bool {
+	// ViE is deliberately mixed-case in the VMF convention. Matching the exact
+	// spelling avoids corrupting an uppercase title word such as "VIE".
+	return value == "ViE"
+}
+
+func findVMFResolutionAnchor(name string, meta api.PreparedMetadata) (int, bool) {
+	tokens := tokenizeVMFName(name)
+	seen := map[string]struct{}{}
+	for _, resolution := range []string{resolveResolution(meta), detectResolution(name)} {
+		resolution = strings.TrimSpace(resolution)
+		key := strings.ToLower(resolution)
+		if resolution == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		for i := len(tokens) - 1; i >= 0; i-- {
+			if strings.EqualFold(tokens[i].value, resolution) {
+				return tokens[i].start, true
+			}
+		}
+	}
+	for i := len(tokens) - 1; i >= 0; i-- {
+		if strings.EqualFold(tokens[i].value, "4K") || strings.EqualFold(tokens[i].value, "8K") {
+			return tokens[i].start, true
+		}
+	}
+	return 0, false
+}
+
+func findVMFSourceAnchor(name string, meta api.PreparedMetadata) (int, bool) {
+	tokens := tokenizeVMFName(name)
+	if len(tokens) == 0 {
+		return 0, false
+	}
+
+	for _, source := range []string{meta.Release.Source, meta.Source} {
+		sourceTokens := tokenizeVMFName(source)
+		if len(sourceTokens) == 0 {
+			continue
+		}
+		values := make([]string, 0, len(sourceTokens))
+		for _, token := range sourceTokens {
+			values = append(values, token.value)
+		}
+		if anchor, ok := findVMFTokenSequence(tokens, values); ok {
+			return anchor, true
+		}
+	}
+
+	for i, token := range tokens {
+		value := strings.ToLower(token.value)
+		switch value {
+		case "bluray", "webdl", "webrip", "hdtv", "uhdtv", "dvd", "remux":
+			return token.start, true
+		case "web":
+			if i+1 < len(tokens) && (strings.EqualFold(tokens[i+1].value, "DL") || strings.EqualFold(tokens[i+1].value, "Rip")) {
+				return token.start, true
+			}
+		case "blu":
+			if i+1 < len(tokens) && strings.EqualFold(tokens[i+1].value, "Ray") {
+				return token.start, true
+			}
+		case "uhd":
+			if i+1 < len(tokens) && (strings.EqualFold(tokens[i+1].value, "BluRay") || strings.EqualFold(tokens[i+1].value, "Blu")) {
+				return token.start, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func findVMFTokenSequence(tokens []vmfNameToken, values []string) (int, bool) {
+	if len(values) == 0 || len(values) > len(tokens) {
+		return 0, false
+	}
+	// Technical source tokens normally occur after the title. Searching from
+	// the end avoids treating a title word such as "Web" as the source marker.
+	for start := len(tokens) - len(values); start >= 0; start-- {
+		matched := true
+		for offset, value := range values {
+			if !strings.EqualFold(tokens[start+offset].value, value) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return tokens[start].start, true
+		}
+	}
+	return 0, false
+}
+
+func findVMFReleaseGroupAnchor(name string, meta api.PreparedMetadata) (int, bool) {
+	groups := []string{
+		strings.TrimSpace(meta.Release.Group),
+		strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(meta.Tag), "-")),
+	}
+	for _, group := range groups {
+		if group == "" {
+			continue
+		}
+		if anchor, ok := findVMFReleaseGroupStart(name, group); ok {
+			return anchor, true
+		}
+	}
+	return 0, false
+}
+
+func findVMFReleaseGroupStart(name string, group string) (int, bool) {
+	group = strings.TrimSpace(group)
+	if group == "" {
+		return 0, false
+	}
+
+	trimmedName := strings.TrimRightFunc(name, unicode.IsSpace)
+	groupStart, ok := foldSuffixStart(trimmedName, group)
+	if !ok {
+		return 0, false
+	}
+
+	boundary := groupStart
+	for boundary > 0 {
+		r, size := utf8.DecodeLastRuneInString(trimmedName[:boundary])
+		if !unicode.IsSpace(r) {
+			break
+		}
+		boundary -= size
+	}
+	if boundary > 0 && trimmedName[boundary-1] == '-' {
+		return boundary - 1, true
+	}
+	return 0, false
+}
+
+func insertVMFTagBeforeToken(name string, anchor int, tag string) string {
+	separator := preferredVMFSeparator(name, anchor)
+	rendered := renderVMFTag(tag, separator)
+	if anchor <= 0 {
+		return rendered + separator + name
+	}
+	return name[:anchor] + rendered + separator + name[anchor:]
+}
+
+func insertVMFTagBeforeGroup(name string, anchor int, tag string) string {
+	separator := preferredVMFSeparator(name, anchor)
+	rendered := renderVMFTag(tag, separator)
+	if anchor <= 0 {
+		return rendered + name
+	}
+	return name[:anchor] + separator + rendered + name[anchor:]
+}
+
+func renderVMFTag(tag string, separator string) string {
+	if separator == "." {
+		return strings.ReplaceAll(tag, " ", ".")
+	}
+	return tag
+}
+
+func preferredVMFSeparator(name string, anchor int) string {
+	if anchor > 0 && anchor <= len(name) {
+		switch name[anchor-1] {
+		case '.':
+			return "."
+		case ' ', '\t':
+			return " "
+		}
+	}
+
+	tokens := tokenizeVMFName(name)
+	dots := 0
+	spaces := 0
+	for i := 1; i < len(tokens); i++ {
+		gap := name[tokens[i-1].end:tokens[i].start]
+		if strings.Contains(gap, ".") {
+			dots++
+		}
+		if strings.IndexFunc(gap, unicode.IsSpace) >= 0 {
+			spaces++
+		}
+	}
+	if dots > spaces {
+		return "."
+	}
+	return " "
+}
+
+func tokenizeVMFName(name string) []vmfNameToken {
+	tokens := make([]vmfNameToken, 0, len(strings.Fields(name)))
+	start := -1
+	for index, r := range name {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			if start == -1 {
+				start = index
+			}
+			continue
+		}
+		if start != -1 {
+			tokens = append(tokens, vmfNameToken{start: start, end: index, value: name[start:index]})
+			start = -1
+		}
+	}
+	if start != -1 {
+		tokens = append(tokens, vmfNameToken{start: start, end: len(name), value: name[start:]})
+	}
+	return tokens
 }
 
 func resolveDPAudioLabel(languages []string) string {

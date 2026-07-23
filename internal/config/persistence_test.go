@@ -1512,6 +1512,35 @@ func TestSaveLoadDatabaseRoundTripPreservesWatchTorrentClient(t *testing.T) {
 	}
 }
 
+func TestSaveLoadDatabaseRoundTripPreservesVMFModQ(t *testing.T) {
+	t.Parallel()
+
+	repo := &jsonRoundTripRepo{}
+	input := &Config{
+		MainSettings:       MainSettingsConfig{TMDBAPI: "fixture-token"},
+		ScreenshotHandling: ScreenshotHandlingConfig{Screens: 1},
+		Trackers: TrackersConfig{
+			DefaultTrackers: CSVList{"VMF"},
+			Trackers: map[string]TrackerConfig{
+				"VMF": {ModQ: true},
+			},
+		},
+	}
+	configureConfigSecretEncryption(t, input)
+
+	if err := SaveToDatabase(context.Background(), input, repo); err != nil {
+		t.Fatalf("SaveToDatabase failed: %v", err)
+	}
+
+	loaded, err := LoadFromDatabase(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("LoadFromDatabase failed: %v", err)
+	}
+	if !loaded.Trackers.Trackers["VMF"].ModQ {
+		t.Fatal("expected VMF modq to survive database marshal round-trip")
+	}
+}
+
 func TestExportToJSONFallsBackToPlaintextWithoutBootstrap(t *testing.T) {
 	t.Parallel()
 

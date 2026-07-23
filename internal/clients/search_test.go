@@ -815,6 +815,15 @@ func TestMatchTrackerURLsMatchesNETHDAnnounce(t *testing.T) {
 	}
 }
 
+func TestMatchTrackerURLsMatchesVMFAnnounce(t *testing.T) {
+	t.Parallel()
+
+	matched := matchTrackerURLs([]string{"https://tracker.vietmediaf.store/announce/fixture-passkey"})
+	if !containsString(matched, "VMF") {
+		t.Fatalf("expected VMF in matched trackers, got %v", matched)
+	}
+}
+
 func TestExtractTrackerMatchesHandlesNETHDComments(t *testing.T) {
 	t.Parallel()
 

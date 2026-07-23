@@ -764,14 +764,19 @@ func TestEvaluateRulesMetadataPolicyReturnsEvaluatedEmpty(t *testing.T) {
 	}
 }
 
-func TestEvaluateRulesModifiedReleaseExemptsManual(t *testing.T) {
+func TestEvaluateRulesModifiedReleaseExemptions(t *testing.T) {
 	t.Parallel()
 
 	renamed := api.PreparedMetadata{
 		SourcePath: "/data/movies/Example Movie 2026 2160p MA WEB-DL DDP5 1 HDR H 265-GRP",
 		Release:    api.ReleaseInfo{Group: "GRP"},
 	}
-	if got := evaluateNonMetadataRulesForTest(context.Background(), "MANUAL", renamed); hasRuleFailure(got, "modified_release") {
-		t.Fatalf("expected MANUAL to be exempt from modified_release, got %#v", got)
+	for _, tracker := range []string{"MANUAL", "VMF"} {
+		t.Run(tracker, func(t *testing.T) {
+			t.Parallel()
+			if got := evaluateNonMetadataRulesForTest(context.Background(), tracker, renamed); hasRuleFailure(got, "modified_release") {
+				t.Fatalf("expected %s to be exempt from modified_release, got %#v", tracker, got)
+			}
+		})
 	}
 }
